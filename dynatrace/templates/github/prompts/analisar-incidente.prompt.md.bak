@@ -1,0 +1,420 @@
+---
+mode: agent
+description: "Analisa o último incidente Dynatrace coletado pelo script"
+---
+
+## Estrutura do workspace
+
+Cada serviço tem seu próprio diretório: `/<nome-do-servico>/data/`. Dentro, os arquivos `*_analysis.md` são ordenados por timestamp (YYYYMMDD_HHMMSS). O arquivo com o maior timestamp é o **incidente mais recente** (coleta atual).
+
+## Princípios da investigação
+
+> **CONSISTÊNCIA**: A investigação deve SEMPRE cobrir todas as plataformas e todos os serviços da cadeia mencionados no arquivo, independente da ordem. O resultado deve ser o mesmo não importa quantas vezes a análise seja executada.
+
+> **PROFUNDIDADE**: Não pare na primeira camada. Se o serviço A chama B que chama C que chama o sistema externo D, investigue A, B, C e documente o que D retorna. O Davis identifica o SINTOMA (failure rate), sua tarefa é encontrar a CAUSA.
+
+> **COBERTURA DE PLATAFORMA**: O arquivo de análise indica as plataformas envolvidas nos campos `Plataforma`, `Tecnologia`, `Tipo`. Se menciona **AWS Lambda E Kubernetes/K8s**, investigue AMBOS. Se menciona múltiplas contas AWS, investigue TODAS.
+
+> **🚫 ANÁLISE INCOMPLETA**: Se você encontrar que o problema está em um serviço downstream mas NÃO conseguir investigar os logs/métricas desse serviço, a análise está **INCOMPLETA**. NÃO conclua com "possível mudança de contrato", "validar com a equipe", ou "serviço em outra conta". Em vez disso: **VARRA as contas AWS até encontrar o recurso e investigue-o**. Só declare a causa raiz quando tiver EVIDÊNCIA nos logs (a mensagem de erro real).
+
+> **📝 OUTPUT OBRIGATÓRIO**: Ao final da análise, você DEVE fazer append do resultado completo no mesmo arquivo `*_analysis.md` que leu no PASSO 1. Se o arquivo não tiver a seção "# Análise Copilot" ao final, a tarefa NÃO está concluída. Use a ferramenta de edição para inserir o conteúdo no final do arquivo.
+
+---
+
+## Ordem de análise
+
+Para cada diretório de serviço que contenha um arquivo `*_analysis.md`:
+
+### PASSO 1 — Leia APENAS o último arquivo (maior timestamp)
+Este é o incidente ativo. Toda a análise deve começar por estes dados.
+
+### PASSO 2 — Mapeie TODOS os relacionamentos (ANTES de investigar)
+
+O arquivo de análise contém múltiplos serviços e relacionamentos. **Extraia TODOS antes de executar qualquer comando:**
+
+1. **Davis Root Cause**: campo `Root Cause` — serviço que o Davis aponta como ORIGEM
+2. **Workloads**: campo `Workload` — lista TODOS os serviços envolvidos (separados por vírgula)
+3. **Cloud ID**: pode apontar para QUALQUER serviço da cadeia (caller, intermediário, etc.) — NÃO assuma que é o root cause
+4. **Impacto**: campo `Impacto` — mostra serviços e aplicações afetados upstream (callers, mobile apps)
+5. **Evidências Davis**: CADA linha `⚡` ou `🔴` menciona um serviço diferente:
+   - `Response time degradation → gateway-dashboard` = gateway-dashboard afetado
+   - `Deployment spec change → dashboard-service-api` = dashboard-service-api mudou
+   - `Metric: Kubernetes: Workload → X` = X é um workload K8s a investigar
+6. **Conta AWS**: campo `Conta` pode ser de apenas UM dos serviços. Os outros podem estar em OUTRAS contas
+7. **Plataformas**: campo `Tecnologia` (CONTAINERD = K8s, AWS_LAMBDA = Lambda, NODE_JS = runtime)
+
+**Monte o mapa com TODOS os pontos — não apenas root cause e caller:**
+```
+Serviços encontrados no arquivo:
+  1. <root_cause>    — papel: ROOT CAUSE (Davis)      — conta: ???  — plataforma: ???
+  2. <workload_2>    — papel: caller/intermediário    — conta: ???  — plataforma: ???
+  3. <workload_3>    — papel: dependência/impactado   — conta: ???  — plataforma: ???
+  4. <impacto_svc>   — papel: afetado upstream        — conta: ???  — plataforma: ???
+  ...
+```
+
+> **REGRA**: Se o arquivo menciona 4 serviços, investigue os 4. Se menciona 2, investigue 2. Nunca investigue apenas 1.
+
+### PASSO 3 — Investigação SISTEMÁTICA (TODOS os pontos, TODAS as plataformas)
+
+> ⚠️ **REGRA**: Investigue na ordem INVERSA do fluxo — comece pelo ROOT CAUSE (Davis), depois dependências do root cause, depois callers. Investigue CADA serviço mencionado no arquivo até esclarecer seu papel na cadeia.
+
+#### 3.1 — PRIMEIRO: Encontre o ROOT CAUSE na conta AWS correta
+
+O Davis identifica o root cause por nome (ex: `loan-service`). O `Cloud ID` e `Conta` no arquivo geralmente são de OUTRO serviço (o caller).
+
+**PASSO OBRIGATÓRIO — Verifique se o root cause está na conta do arquivo:**
+```bash
+# Verificar se o root cause tem log group na conta informada
+aws logs describe-log-groups --profile <PROFILE_DO_ARQUIVO> --region us-east-1 \
+  --query "logGroups[].logGroupName" --output text 2>/dev/null | tr '\t' '\n' | grep -i "<root-cause-name>"
+```
+
+**Se o resultado for VAZIO → o root cause está em OUTRA CONTA. Execute a busca:**
+
+```bash
+# BUSCA EM TODAS AS CONTAS — usar --profile para cada profile configurado
+service_name="<root-cause-name>"  # ex: loan-service
+profiles=$(aws configure list-profiles)
+
+for profile in $profiles; do
+  found=$(aws logs describe-log-groups --profile "$profile" --region us-east-1 \
+    --query "logGroups[].logGroupName" --output text 2>/dev/null | tr '\t' '\n' | grep -i "$service_name")
+  if [[ -n "$found" ]]; then
+    account=$(aws configure get sso_account_id --profile "$profile" 2>/dev/null)
+    echo "ENCONTRADO | Profile: $profile | Conta: $account | LogGroup: $found"
+    break
+  fi
+done
+```
+
+> 🚫 **PROIBIDO**: Concluir a análise sem ter encontrado e investigado o root cause. Frases como "possível mudança de contrato", "validar com a equipe", "serviço em outra conta não acessível" significam que a análise **FALHOU**. Execute a busca acima.
+
+#### 3.2 — Investigue o ROOT CAUSE na conta encontrada
+
+Após encontrar o profile/conta do root cause, investigue **nessa conta**:
+
+```bash
+# Descobrir o nome exato da Lambda (pode ter sufixos como -lambda-prod-ACCOUNTID-REGION-v2)
+lambda_name=$(aws logs describe-log-groups --profile "$profile" --region us-east-1 \
+  --query "logGroups[].logGroupName" --output text 2>/dev/null | tr '\t' '\n' | grep -i "$service_name" | sed 's|/aws/lambda/||')
+
+# Config — runtime, timeout, memory, ÚLTIMO DEPLOY (LastModified)
+aws lambda get-function-configuration --profile "$profile" --region us-east-1 \
+  --function-name "$lambda_name"
+
+# LOGS — buscar A MENSAGEM DE ERRO REAL (aqui aparecem UF inválida, parcela já paga, ECONNRESET)
+aws logs filter-log-events --profile "$profile" --region us-east-1 \
+  --log-group-name "/aws/lambda/$lambda_name" \
+  --start-time <EPOCH_MS_START> --end-time <EPOCH_MS_END> \
+  --filter-pattern "?ERROR ?Error ?error ?Exception ?ECONNRESET ?ETIMEDOUT ?failed" \
+  --limit 30 --output json 2>/dev/null | jq -r '.events[]?.message // empty' | head -50
+
+# Métricas — Errors, Throttles, Invocations, Duration
+aws cloudwatch get-metric-statistics --profile "$profile" --region us-east-1 \
+  --namespace AWS/Lambda --metric-name Errors \
+  --dimensions Name=FunctionName,Value="$lambda_name" \
+  --start-time <ISO> --end-time <ISO> --period 300 --statistics Sum
+
+aws cloudwatch get-metric-statistics --profile "$profile" --region us-east-1 \
+  --namespace AWS/Lambda --metric-name Throttles \
+  --dimensions Name=FunctionName,Value="$lambda_name" \
+  --start-time <ISO> --end-time <ISO> --period 300 --statistics Sum
+
+aws cloudwatch get-metric-statistics --profile "$profile" --region us-east-1 \
+  --namespace AWS/Lambda --metric-name Invocations \
+  --dimensions Name=FunctionName,Value="$lambda_name" \
+  --start-time <ISO> --end-time <ISO> --period 300 --statistics Sum
+
+aws cloudwatch get-metric-statistics --profile "$profile" --region us-east-1 \
+  --namespace AWS/Lambda --metric-name Duration \
+  --dimensions Name=FunctionName,Value="$lambda_name" \
+  --start-time <ISO> --end-time <ISO> --period 60 --statistics Average Maximum
+
+# CloudTrail — deploys e mudanças no root cause
+aws cloudtrail lookup-events --profile "$profile" --region us-east-1 \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue="$lambda_name" \
+  --start-time <ISO_3DAYS_AGO> --end-time <ISO_NOW> --max-results 10
+```
+
+> **RESULTADO ESPERADO**: Nos logs do root cause você encontrará as mensagens de erro REAIS (ex: "Parcela 9 já paga", "UF inválida", "ECONNRESET", erros de sistemas externos como BMP/Conductor). Se só encontra statusCode genérico, continue descendo nas dependências.
+
+#### 3.3 — Depois: Investigue o caller (confirmar que é saudável)
+
+Após investigar o root cause na conta correta, volte ao caller (conta do arquivo) para confirmar:
+- Ele recebe o erro do root cause (HTTP 4xx/5xx) → problema está downstream, não nele
+- OU ele mesmo gera o erro (timeout, OOM, throttle) → problema é infra do caller
+
+**Se for Kubernetes — investigue o cluster:**
+```bash
+# Histórico de deploys recentes
+kubectl rollout history deployment/<service-name> -n <namespace>
+
+# Logs do pod com erros no período
+kubectl logs -l app=<service-name> -n <namespace> --since=4h | grep -i "error\|exception\|timeout\|400\|500" | tail -50
+
+# Status dos pods (restarts, not ready)
+kubectl get pods -l app=<service-name> -n <namespace> -o wide
+
+# Eventos recentes (OOM, scheduling, probes)
+kubectl get events -n <namespace> --field-selector involvedObject.name=<pod-name> --sort-by='.lastTimestamp' | tail -20
+
+# Describe do deployment (replicas, resources, probes)
+kubectl describe deployment/<service-name> -n <namespace>
+
+# HPA - se houve autoscaling
+kubectl get hpa -n <namespace> | grep <service-name>
+kubectl describe hpa/<service-name> -n <namespace>
+```
+
+**Se for AMBOS (Lambda + K8s)** — investigue os DOIS. São perspectivas complementares do MESMO serviço.
+
+#### 3.2 — Investigue CADA outro serviço mencionado no arquivo
+
+Para CADA serviço adicional encontrado no PASSO 2 (workloads, impactos, evidências Davis):
+
+- **Determine se é Lambda ou K8s** (CONTAINERD/Deployment spec = K8s; AWS_LAMBDA = Lambda)
+- **Resolva a conta AWS** (pode ser diferente do root cause!)
+- **Verifique seu papel**: é caller? é dependência? foi escalado? teve deploy?
+- **Colete métricas e logs** para confirmar se está saudável ou com problemas
+
+Exemplo: se o arquivo menciona `dashboard-service-api` com `Deployment spec change → replicas 5→18`, investigue:
+- Por que escalou? (HPA? manual?)
+- Os logs mostram erros?
+- A degradação começou antes ou depois do scaling?
+
+#### 3.3 — Desça nas dependências externas do root cause
+
+Se os logs do root cause revelam erros de **sistemas externos** (BMP, Conductor, banco de dados, APIs terceiras):
+- Documente a **mensagem de erro exata** (ex: "Parcela 9 já paga", "UF inválida", "ECONNRESET")
+- Identifique o **sistema externo** responsável
+- Verifique se há **múltiplos tipos de erro** (cada um pode ter causa diferente)
+- Quantifique: qual erro é mais frequente?
+
+> O objetivo é chegar ao nível mais profundo possível — se o erro vem de um sistema externo (BMP, Conductor), documente EXATAMENTE o que esse sistema retorna.
+
+#### 3.3 — Comandos AWS (⚠️ SOMENTE LEITURA)
+
+Para **CADA Lambda na cadeia** (root cause E caller — geralmente são contas DIFERENTES):
+
+```bash
+# Resolver profile para a conta
+grep -B10 "sso_account_id = <ACCOUNT_ID>" ~/.aws/config | grep '^\[profile' | tail -1 | sed 's/\[profile //' | sed 's/\]//'
+
+# Se não souber a conta da dependência, buscar a Lambda pelo nome
+aws lambda list-functions --profile <PROFILE> --region us-east-1 --output json 2>&1 | jq -r '.Functions[].FunctionName' | grep -i <nome-servico>
+
+# Config da Lambda (runtime, timeout, memory, last deploy)
+aws lambda get-function-configuration --profile <PROFILE> --region <REGION> --function-name <FUNCTION_NAME>
+
+# Logs — buscar A EXCEPTION REAL (não apenas o status code)
+aws logs filter-log-events --profile <PROFILE> --region <REGION> \
+  --log-group-name "/aws/lambda/<FUNCTION_NAME>" \
+  --start-time <EPOCH_MS> --end-time <EPOCH_MS> \
+  --filter-pattern "?ERROR ?Error ?Exception ?ECONNREFUSED ?ETIMEDOUT ?ECONNRESET ?timeout ?failed" \
+  --limit 30
+
+# Métricas de saúde
+aws cloudwatch get-metric-statistics --profile <PROFILE> --region <REGION> \
+  --namespace AWS/Lambda --metric-name Errors \
+  --dimensions Name=FunctionName,Value=<FUNCTION_NAME> \
+  --start-time <ISO> --end-time <ISO> --period 300 --statistics Sum
+
+aws cloudwatch get-metric-statistics --profile <PROFILE> --region <REGION> \
+  --namespace AWS/Lambda --metric-name Throttles \
+  --dimensions Name=FunctionName,Value=<FUNCTION_NAME> \
+  --start-time <ISO> --end-time <ISO> --period 300 --statistics Sum
+
+aws cloudwatch get-metric-statistics --profile <PROFILE> --region <REGION> \
+  --namespace AWS/Lambda --metric-name Duration \
+  --dimensions Name=FunctionName,Value=<FUNCTION_NAME> \
+  --start-time <ISO> --end-time <ISO> --period 60 --statistics Average Maximum
+
+# CloudTrail — deploys e mudanças
+aws cloudtrail lookup-events --profile <PROFILE> --region <REGION> \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=<FUNCTION_NAME> \
+  --start-time <ISO> --end-time <ISO> --max-results 20
+```
+
+#### 3.4 — Regras de uso de jq (EVITAR ERROS)
+
+> ⚠️ **jq falha com `null` quando o resultado está vazio.** Use SEMPRE padrões null-safe:
+
+**NUNCA faça:**
+```bash
+# ❌ Falha se events está vazio
+jq -r '.events[0].timestamp | . / 1000 | strftime(...)'
+jq -r '.events | last | .timestamp | ...'
+jq -r '.events[-1].timestamp | ...'
+```
+
+**SEMPRE faça:**
+```bash
+# ✅ Verifica se há eventos antes de processar
+jq -r 'if (.events | length) > 0 then .events[0].message else "SEM_EVENTOS" end'
+
+# ✅ Para timestamps seguros
+jq -r '.events[]? | select(.timestamp != null) | "\(.timestamp) | \(.message[0:200])"'
+
+# ✅ Para contar eventos (nunca falha)
+jq '.events | length'
+
+# ✅ Para listar mensagens (pula nulls)
+jq -r '.events[]?.message // empty'
+
+# ✅ Para sort seguro
+jq -r '[.Datapoints[]? | select(.Timestamp != null)] | sort_by(.Timestamp) | .[] | "\(.Timestamp) | \(.Sum)"'
+
+# ✅ Para extrair campos que podem não existir
+jq -r '.Events[]? | "\(.EventTime // "?") | \(.EventName // "?") | \(.Username // "?")"'
+```
+
+**Regras gerais de jq:**
+- Use `[]?` (com `?`) ao iterar arrays que podem estar vazios
+- Use `// empty` ou `// "N/A"` para valores que podem ser null
+- Use `select(.campo != null)` antes de operações aritméticas
+- Para `strftime`: sempre verifique que o valor não é null ANTES de dividir
+- Prefira `--output text` ou `--output table` do AWS CLI quando o parsing for simples
+- Se o comando pode retornar vazio, adicione `|| echo "SEM_RESULTADOS"` no final
+
+> ⚠️ **NUNCA execute comandos que alterem estado** (put, create, delete, update, invoke, stop, terminate). Apenas leitura.
+
+#### 3.5 — Critérios para classificar CADA serviço investigado
+
+Após coletar dados de TODOS os pontos, preencha esta tabela para CADA serviço:
+
+| Serviço | Conta AWS | Plataforma | Errors | Throttles | Duration | Logs (mensagem real) | Veredicto |
+|---------|-----------|------------|--------|-----------|----------|---------------------|-----------|
+| root cause | YYYYY | Lambda | 0 | 0 | normal | "Parcela já paga" (BMP) | ⚠️ Erro de dependência externa |
+| caller | XXXXX | Lambda | 0 | 0 | normal | recebe 400 do root cause | ✅ SAUDÁVEL — propaga |
+| svc-api | YYYYY | K8s | - | - | - | replicas 5→18 (HPA) | ⚡ Reagiu ao problema |
+| dependência | externo | - | - | - | - | "UF inválida", "ECONNRESET" | 🔴 ORIGEM REAL |
+
+> **IMPORTANTE**: Copie as mensagens de erro REAIS dos logs — não resuma. É a evidência que comprova a causa.
+
+### PASSO 3.5 — Retroalimentação via Dynatrace
+
+Se uma dependência mencionada no arquivo **não tem dados coletados** no workspace (não existe diretório para ela), colete:
+
+```bash
+view_dyna_incidents <nome-da-dependencia>
+```
+
+Isso gera um novo `*_analysis.md` com dados do Davis (conta AWS, métricas, evidências) para aquele serviço. Leia o arquivo gerado e incorpore na análise.
+
+**Quando usar**: sempre que o root cause ou uma dependência não tiver diretório no workspace.
+
+### PASSO 4 — Diagnóstico consolidado
+
+Após investigar TODOS os pontos da cadeia (Lambda + K8s + dependências externas), consolide:
+
+## 1. Resumo Executivo
+Síntese incluindo a **cadeia completa** e onde exatamente o erro se origina. Mencione o sistema/serviço FINAL que gera o erro.
+
+## 2. Mapa de Dependências
+```
+[caller] → [serviço] → [origem do erro] → [dependência externa]
+  ✅ saudável  ✅ saudável    🔴 ORIGEM       ❌ indisponível/rejeitando
+  conta: X      conta: Y       conta: Y         externo: nome_sistema
+  plat: Lambda  plat: K8s      plat: Lambda     plat: terceiro
+```
+
+## 3. Tabela de Investigação
+Inclua a tabela completa com TODOS os serviços investigados, suas métricas, mensagens de log reais e veredicto (conforme 3.5).
+
+## 4. Causa Raiz
+- **Onde**: serviço exato, conta AWS, e dependência externa (se aplicável)
+- **O que**: exception/mensagem de erro real **COPIADA DO LOG** (ex: "Parcela 9 já paga, não é possível gerar liquidação", "UF inválida", "ECONNRESET")
+- **Tipo**: infraestrutura | negócio/validação | dependência externa
+- **Evidência**: métricas + logs que comprovam
+- Se a infra está saudável (Errors=0, Throttles=0) mas há erros de negócio/dependência, declare: "Problema NÃO é infraestrutural — origem: <sistema externo>"
+
+## 5. Timeline
+Ordem cronológica com horários reais extraídos dos logs/métricas.
+
+## 6. Impacto
+- Serviços e usuários afetados
+- Severidade (P1/P2/P3)
+
+## 7. Ações de Remediação
+- **Imediatas**: com comandos específicos (kubectl E/OU aws cli conforme a plataforma)
+- **Curto prazo**: correções
+- **Preventivas**: evitar recorrência
+
+### PASSO 5 — Histórico do MESMO serviço (somente no final)
+Verifique se existem **outros arquivos mais antigos** no mesmo diretório. Se existirem:
+
+## 8. Histórico e Recorrência
+- Compare com incidentes anteriores **do mesmo serviço** (mesma pasta)
+- Identifique padrões: mesmo endpoint? mesma causa? mesma dependência?
+- **NÃO correlacione com incidentes de outros diretórios**
+
+## 9. Post-Mortem Draft
+- **Título**: descrição curta
+- **Cadeia**: mapa completo de todos os serviços envolvidos
+- **Duração**: tempo total
+- **Causa raiz**: com a exception/mensagem REAL copiada dos logs, não genérica
+- **Resolução**: o que foi feito
+- **Ações futuras**: melhorias
+
+### PASSO 6 — ⚠️ OBRIGATÓRIO: Salvar resultado NO ARQUIVO (NÃO pule este passo)
+
+**Este passo é OBRIGATÓRIO. A tarefa NÃO está concluída até que o resultado esteja ESCRITO no arquivo.**
+
+Após concluir a investigação, **insira o resultado completo no FINAL do mesmo arquivo `*_analysis.md`** que foi lido no PASSO 1.
+
+**Como fazer**: Use a ferramenta de edição de arquivo para ADICIONAR (append) o conteúdo abaixo no final do arquivo. NÃO modifique o conteúdo existente — apenas adicione após a última linha.
+
+O arquivo final terá:
+1. **Parte 1 — Dados Dynatrace** (já existe, NÃO altere): os dados coletados pelo script
+2. **Parte 2 — Análise Copilot** (ADICIONE ao final): toda a investigação e diagnóstico
+
+**Formato EXATO do conteúdo a adicionar no final do arquivo:**
+
+```markdown
+
+---
+
+# Análise Copilot — <DATA_HORA>
+
+## Mapa de Dependências
+<cadeia completa com status de cada ponto>
+
+## Tabela de Investigação
+<tabela com TODOS os serviços, contas, métricas, mensagens reais, veredicto>
+
+## Causa Raiz
+<onde + o que + tipo + evidência copiada dos logs>
+
+## Timeline
+<eventos em ordem cronológica>
+
+## Impacto
+<serviços, usuários, severidade>
+
+## Ações de Remediação
+<imediatas + curto prazo + preventivas com comandos>
+
+## Histórico e Recorrência
+<padrões identificados na mesma pasta, se houver>
+
+## Post-Mortem Draft
+<rascunho completo>
+```
+
+> **O arquivo `*_analysis.md` deve ser COMPLETO** — contendo os dados brutos do Dynatrace E a análise do Copilot. Não crie arquivos separados. Não deixe o arquivo só com a parte do Dynatrace.
+
+> 🚫 **Se você apresentou a análise no chat mas NÃO escreveu no arquivo, VOLTE e escreva agora.** A análise só tem valor se estiver persistida no arquivo para consulta futura.
+
+---
+
+**Regras de consistência:**
+- Responda em **português brasileiro**
+- **SEMPRE investigue o root cause do Davis PRIMEIRO**, não o caller
+- **SEMPRE investigue TODAS as plataformas** mencionadas (Lambda + K8s = investigue ambos)
+- **SEMPRE busque a conta AWS REAL** do root cause (Cloud ID pode ser do caller)
+- **SEMPRE desça na cadeia** até encontrar a exception/mensagem original
+- **SEMPRE salve a análise no final do arquivo `*_analysis.md`** — o arquivo não está completo sem a parte do Copilot
+- Se o mesmo incidente aparece com dados diferentes em coletas distintas, priorize a coleta mais recente
+- Não conclua "problema de contrato/validação" sem mostrar a mensagem de erro real do log
+- Priorize por severidade: ABERTO > FECHADO

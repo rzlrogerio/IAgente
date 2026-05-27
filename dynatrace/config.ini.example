@@ -1,0 +1,43 @@
+# ── config.ini ──────────────────────────────────────────────────
+# Configurações do Dynatrace Incidents Tool
+# Copie para config.ini e ajuste conforme necessário.
+# Valores aqui são sobrescritos por argumentos CLI (ex: --window=1h).
+# Tokens continuam sendo lidos de variáveis de ambiente (.zshrc / .env).
+
+[defaults]
+# Janela padrão quando --window não é informado (ex: 5m, 15m, 1h, 6h)
+window = 5m
+
+# Quantidade máxima de incidentes retornados
+limit = 5
+
+# Timeout máximo da consulta em segundos (shell aborta se exceder)
+query_timeout = 120
+
+# Timeout por chamada de enriquecimento de entidade (segundos)
+entity_timeout = 8
+
+# Máximo de entidades enriquecidas por incidente
+max_entities_per_incident = 2
+
+# Máximo de callers verificados por entidade
+max_callers_per_entity = 2
+
+[pdf]
+# Margens do PDF (cm)
+margin_left = 1.2
+margin_right = 1.2
+margin_top = 1.5
+margin_bottom = 1.5
+
+# Fontes
+font_main = DejaVu Sans
+font_mono = DejaVu Sans Mono
+
+[tenants]
+# Lista de tenants disponíveis para seleção interativa.
+# Formato: label = url
+# Os tokens são lidos de variáveis de ambiente:
+#   DYNATRACE_ENV_URL_<LABEL>, DYNATRACE_API_TOKEN_<LABEL>, DYNATRACE_PLATFORM_TOKEN_<LABEL>
+tenant_a = https://<tenant-a>.live.dynatrace.com
+tenant_b = https://<tenant-b>.live.dynatrace.com
