@@ -1,0 +1,1467 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Resolve symlinks ────────────────────────────────────────────
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+# ── Constantes ──────────────────────────────────────────────────
+CONFIG_FILE="$ROOT_DIR/config.ini"
+
+# Lê valor de config.ini: _ini_get <section> <key> <fallback>
+_ini_get() {
+  local section="$1" key="$2" fallback="${3:-}"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local value
+    value=$(awk -F '=' -v section="[$section]" -v key="$key" '
+      $0 == section { found=1; next }
+      /^\[/ { found=0 }
+      found && $1 ~ "^[[:space:]]*"key"[[:space:]]*$" { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }
+    ' "$CONFIG_FILE")
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+  fi
+  echo "$fallback"
+}
+
+# Carrega configurações do config.ini (com fallbacks)
+CFG_WINDOW="$(_ini_get defaults window 5m)"
+CFG_QUERY_TIMEOUT="$(_ini_get defaults query_timeout 120)"
+CFG_PDF_MARGIN_LEFT="$(_ini_get pdf margin_left 1.2)"
+CFG_PDF_MARGIN_RIGHT="$(_ini_get pdf margin_right 1.2)"
+CFG_PDF_MARGIN_TOP="$(_ini_get pdf margin_top 1.5)"
+CFG_PDF_MARGIN_BOTTOM="$(_ini_get pdf margin_bottom 1.5)"
+CFG_PDF_FONT_MAIN="$(_ini_get pdf font_main "DejaVu Sans")"
+CFG_PDF_FONT_MONO="$(_ini_get pdf font_mono "DejaVu Sans Mono")"
+
+INCIDENTS_BASE="$HOME/Documents/incidentes"
+LEGACY_VENV="/tmp/dynatrace-incidentes-venv"
+DEFAULT_VENV="${XDG_CACHE_HOME:-$HOME/.cache}/dynatrace-incidentes-venv"
+PERSISTENT_VENV="${DYNATRACE_INCIDENTS_VENV:-}"
+
+if [[ -z "$PERSISTENT_VENV" ]]; then
+  if [[ -x "$LEGACY_VENV/bin/python" ]]; then
+    PERSISTENT_VENV="$LEGACY_VENV"
+  else
+    PERSISTENT_VENV="$DEFAULT_VENV"
+  fi
+fi
+
+VENV_PYTHON="$PERSISTENT_VENV/bin/python"
+VENV_PIP="$PERSISTENT_VENV/bin/pip"
+REQ_FILE="$ROOT_DIR/requirements.txt"
+REQ_SNAPSHOT="$PERSISTENT_VENV/.requirements.snapshot"
+
+# ── Funções utilitárias ─────────────────────────────────────────
+print_header() { echo -e "\n\033[1;36m▸ $1\033[0m"; }
+print_ok()     { echo -e "  \033[0;32m✔ $1\033[0m"; }
+print_warn()   { echo -e "  \033[0;33m⚠ $1\033[0m"; }
+print_err()    { echo -e "  \033[0;31m✘ $1\033[0m" >&2; }
+
+# Spinner — roda em background enquanto o Python processa
+SPINNER_PID=""
+start_spinner() {
+  local msg="${1:-Consultando Dynatrace...}"
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local start=$SECONDS
+  (
+    while true; do
+      for f in "${frames[@]}"; do
+        local elapsed=$(( SECONDS - start ))
+        printf "\r\033[1;33m  %s %s (%ds)\033[0m " "$f" "$msg" "$elapsed"
+        sleep 0.1
+      done
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID" 2>/dev/null
+}
+
+stop_spinner() {
+  if [[ -n "${SPINNER_PID:-}" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null
+    wait "$SPINNER_PID" 2>/dev/null
+    SPINNER_PID=""
+    printf "\r\033[K"  # limpa a linha do spinner
+  fi
+}
+
+# Verifica dependências para geração de PDF (pandoc + xelatex + fvextra + fonte DejaVu)
+PDF_AVAILABLE=false
+_check_pdf_deps() {
+  local missing=()
+
+  if ! command -v pandoc >/dev/null 2>&1; then
+    missing+=("pandoc")
+  fi
+
+  if ! command -v xelatex >/dev/null 2>&1; then
+    missing+=("xelatex")
+  fi
+
+  # Verifica se fvextra.sty existe (necessário para quebra de linhas longas no PDF)
+  if command -v kpsewhich >/dev/null 2>&1; then
+    if ! kpsewhich fvextra.sty >/dev/null 2>&1; then
+      missing+=("fvextra (texlive-latex-extra)")
+    fi
+  fi
+
+  # Verifica fonte DejaVu Sans Mono
+  if command -v fc-list >/dev/null 2>&1; then
+    if ! fc-list "DejaVu Sans Mono" 2>/dev/null | grep -q "DejaVu"; then
+      missing+=("fonts-dejavu")
+    fi
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    print_warn "PDF desabilitado — faltam: ${missing[*]}"
+    local os_type
+    os_type="$(uname -s)"
+    if [[ "$os_type" == "Darwin" ]]; then
+      echo "    Instale com: brew install pandoc && brew install --cask mactex-no-gui"
+    else
+      echo "    Instale com: sudo apt install pandoc texlive-xetex texlive-latex-extra fonts-dejavu"
+    fi
+    PDF_AVAILABLE=false
+    return 1
+  fi
+
+  PDF_AVAILABLE=true
+  return 0
+}
+
+# Gera PDF a partir de um arquivo Markdown
+_generate_pdf() {
+  local md_file="$1"
+  local pdf_file="${md_file%.md}.pdf"
+
+  if [[ "$PDF_AVAILABLE" != true ]]; then
+    return 1
+  fi
+
+  if pandoc "$md_file" -s -o "$pdf_file" \
+    --pdf-engine=xelatex \
+    -V mainfont="$CFG_PDF_FONT_MAIN" \
+    -V monofont="$CFG_PDF_FONT_MONO" \
+    -V geometry:"left=${CFG_PDF_MARGIN_LEFT}cm,right=${CFG_PDF_MARGIN_RIGHT}cm,top=${CFG_PDF_MARGIN_TOP}cm,bottom=${CFG_PDF_MARGIN_BOTTOM}cm" \
+    -V documentclass="article" \
+    --wrap=auto \
+    -H <(printf '%s\n' \
+      '\usepackage{fvextra}' \
+      '\DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\}}' \
+      '\renewcommand{\texttt}[1]{{\small\ttfamily #1}}' \
+      '\fvset{fontsize=\small,breaklines,breakanywhere}' \
+    ) 2>/dev/null; then
+    print_ok "PDF gerado: $pdf_file"
+    return 0
+  else
+    print_warn "Falha ao gerar PDF de: $md_file"
+    return 1
+  fi
+}
+
+# ── Detecção automática de ambientes Dynatrace ──────────────────
+# Busca variáveis DYNATRACE_ENV_URL_<LABEL> no ambiente corrente.
+# Se não encontrar, tenta carregar de ~/.zshrc, ~/.bashrc ou ~/.oh-my-zsh/envars/dynatrace.zsh.
+# Resultado: DETECTED_ENVS=("label1" "label2" ...)
+DETECTED_ENVS=()
+
+_source_dynatrace_vars() {
+  # Carrega variáveis Dynatrace de arquivos de configuração do usuário (sem sobrescrever)
+  local files=(
+    "$HOME/.zshrc"
+    "$HOME/.bashrc"
+    "$HOME/.oh-my-zsh/envars/dynatrace.zsh"
+  )
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || continue
+    # Extrai apenas linhas DYNATRACE_* e DTCTL_* (export ou não)
+    while IFS= read -r line; do
+      # Remove 'export ' prefix se existir
+      line="${line#export }"
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      # Remove aspas
+      val="${val%\"}"
+      val="${val#\"}"
+      # Só seta se ainda não estiver definida
+      if [[ -n "$key" && -z "${!key:-}" && -n "$val" ]]; then
+        export "$key=$val"
+      fi
+    done < <(grep -E '^\s*(export\s+)?(DYNATRACE_|DTCTL_)[A-Z_]+=.+' "$f" 2>/dev/null | grep -v '^\s*#')
+  done
+}
+
+_detect_dynatrace_envs() {
+  DETECTED_ENVS=()
+  # Procura variáveis DYNATRACE_ENV_URL_<LABEL> no ambiente
+  local var_name
+  while IFS= read -r var_name; do
+    local label="${var_name#DYNATRACE_ENV_URL_}"
+    [[ -n "$label" ]] && DETECTED_ENVS+=("$label")
+  done < <(env | grep -oP '^DYNATRACE_ENV_URL_[A-Z0-9_]+(?==)' 2>/dev/null || \
+           env | sed -nE 's/^(DYNATRACE_ENV_URL_[A-Z0-9_]+)=.*/\1/p')
+}
+
+_load_dynatrace_env() {
+  # Dado um label (por exemplo: TENANT_A, TENANT_B), exporta as variáveis genéricas a partir das sufixadas.
+  local label="${1^^}"  # uppercase
+
+  local url_var="DYNATRACE_ENV_URL_${label}"
+  local platform_var="DYNATRACE_PLATFORM_TOKEN_${label}"
+  local api_var="DYNATRACE_API_TOKEN_${label}"
+
+  if [[ -n "${!url_var:-}" ]]; then
+    export DYNATRACE_ENV_URL="${!url_var}"
+  fi
+  if [[ -n "${!platform_var:-}" ]]; then
+    export DYNATRACE_PLATFORM_TOKEN="${!platform_var}"
+  fi
+  if [[ -n "${!api_var:-}" ]]; then
+    export DYNATRACE_API_TOKEN="${!api_var}"
+  fi
+}
+
+_select_dynatrace_env() {
+  # Se já tem DYNATRACE_ENV_URL genérica definida e tokens OK, não faz nada
+  if [[ -n "${DYNATRACE_ENV_URL:-}" && ( -n "${DYNATRACE_API_TOKEN:-}" || -n "${DYNATRACE_PLATFORM_TOKEN:-}" ) ]]; then
+    return
+  fi
+
+  # Detecta ambientes disponíveis
+  _detect_dynatrace_envs
+
+  # Nenhum ambiente detectado — mostra instruções
+  if [[ ${#DETECTED_ENVS[@]} -eq 0 ]]; then
+    print_warn "Nenhum ambiente Dynatrace detectado (DYNATRACE_ENV_URL_<LABEL>)."
+    echo ""
+    echo "  Configure no seu ~/.zshrc ou ~/.oh-my-zsh/envars/dynatrace.zsh:"
+    echo ""
+    echo "    export DYNATRACE_ENV_URL_TENANT_A=\"https://tenant.live.dynatrace.com\""
+    echo "    export DYNATRACE_PLATFORM_TOKEN_TENANT_A=\"dt0s16.<token>\""
+    echo "    export DYNATRACE_API_TOKEN_TENANT_A=\"dt0c01.<token>\""
+    echo ""
+    return
+  fi
+
+  # Um único ambiente — carrega automaticamente
+  if [[ ${#DETECTED_ENVS[@]} -eq 1 ]]; then
+    local label="${DETECTED_ENVS[0]}"
+    _load_dynatrace_env "$label"
+    print_ok "Ambiente Dynatrace: ${label,,} (unico detectado)"
+    return
+  fi
+
+  # Múltiplos ambientes — seleção interativa
+  local selection="" env_label=""
+
+  if command -v fzf >/dev/null 2>&1; then
+    selection=$(for label in "${DETECTED_ENVS[@]}"; do
+      local url_var="DYNATRACE_ENV_URL_${label}"
+      printf "%-10s %s\n" "${label,,}" "${!url_var:-}"
+    done | fzf --prompt="Selecione o ambiente Dynatrace: " --height=10 --reverse)
+  fi
+
+  # Fallback: menu numérico
+  if [[ -z "$selection" ]]; then
+    if ! command -v fzf >/dev/null 2>&1; then
+      print_warn "fzf não encontrado (menu interativo desabilitado)."
+      echo "  Instale: brew install fzf  (macOS) | sudo apt install fzf (Linux)"
+      echo ""
+    fi
+    echo ""
+    local i=1
+    for label in "${DETECTED_ENVS[@]}"; do
+      local url_var="DYNATRACE_ENV_URL_${label}"
+      printf "  %d) %-10s %s\n" "$i" "${label,,}" "${!url_var:-}"
+      ((i++))
+    done
+    echo ""
+    read -r -p "  Escolha [1-${#DETECTED_ENVS[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DETECTED_ENVS[@]} )); then
+      env_label="${DETECTED_ENVS[$((choice-1))]}"
+    else
+      print_err "Seleção inválida"
+      return
+    fi
+  else
+    env_label="$(echo "$selection" | awk '{print $1}')"
+    env_label="${env_label^^}"
+  fi
+
+  if [[ -z "$env_label" ]]; then
+    return
+  fi
+
+  _load_dynatrace_env "$env_label"
+  print_ok "Ambiente selecionado: ${env_label,,} → ${DYNATRACE_ENV_URL:-}"
+}
+
+# ── 1. Validação de tokens ─────────────────────────────────────
+check_tokens() {
+  local ok=true
+
+  print_header "Verificando tokens Dynatrace..."
+
+  # Carrega variáveis de arquivos de config (se não estiverem no ambiente)
+  _source_dynatrace_vars
+
+  # Se não tem DYNATRACE_ENV_URL genérica, detecta e seleciona ambiente
+  if [[ -z "${DYNATRACE_ENV_URL:-}" ]] || [[ -z "${DYNATRACE_API_TOKEN:-}" && -z "${DYNATRACE_PLATFORM_TOKEN:-}" ]]; then
+    _select_dynatrace_env
+  fi
+
+  # DYNATRACE_ENV_URL
+  if [[ -z "${DYNATRACE_ENV_URL:-}" ]]; then
+    print_err "DYNATRACE_ENV_URL não configurada"
+    ok=false
+  else
+    print_ok "DYNATRACE_ENV_URL: $DYNATRACE_ENV_URL"
+  fi
+
+  # DYNATRACE_API_TOKEN (Classic API — obrigatório)
+  if [[ -z "${DYNATRACE_API_TOKEN:-}" ]]; then
+    print_err "DYNATRACE_API_TOKEN não configurado"
+    ok=false
+  elif [[ "${DYNATRACE_API_TOKEN}" != dt0c01.* ]]; then
+    print_warn "DYNATRACE_API_TOKEN não parece ser um token Classic (esperado dt0c01.*)"
+  else
+    print_ok "DYNATRACE_API_TOKEN: dt0c01.${DYNATRACE_API_TOKEN:7:8}..."
+  fi
+
+  # DYNATRACE_PLATFORM_TOKEN (DQL/Grail — opcional)
+  if [[ -z "${DYNATRACE_PLATFORM_TOKEN:-}" ]]; then
+    print_warn "DYNATRACE_PLATFORM_TOKEN não configurado (opcional, para DQL/Grail)"
+  elif [[ "${DYNATRACE_PLATFORM_TOKEN}" != dt0s16.* ]]; then
+    print_warn "DYNATRACE_PLATFORM_TOKEN não parece ser um token Platform (esperado dt0s16.*)"
+  else
+    print_ok "DYNATRACE_PLATFORM_TOKEN: dt0s16.${DYNATRACE_PLATFORM_TOKEN:7:8}..."
+  fi
+
+  if [[ "$ok" == false ]]; then
+    # Resolve URLs com o tenant selecionado (se disponível)
+    local tenant_id
+    tenant_id="$(echo "${DYNATRACE_ENV_URL:-}" | sed -E 's|https?://([^.]+)\..*|\1|')"
+    local classic_url="https://${tenant_id:-<tenant>}.live.dynatrace.com/ui/access-tokens"
+    local env_url_display="${DYNATRACE_ENV_URL:-https://<tenant>.apps.dynatrace.com}"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "CONFIGURAÇÃO NECESSÁRIA"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "1. Token Classic API (obrigatório)"
+    echo "   Crie em: $classic_url"
+    echo ""
+    echo "   Scopes:"
+    echo "   • problems.read    — consultar incidentes"
+    echo "   • entities.read    — enriquecer com dados de entidades"
+    echo "   • metrics.read     — métricas K8s (CPU, Memory)"
+    echo "   • events.read      — detalhes de eventos (opcional)"
+    echo ""
+    echo "2. Token Platform/DQL (opcional)"
+    echo "   Crie em: https://myaccount.dynatrace.com → Security → Access Tokens"
+    echo ""
+    echo "   Scopes:"
+    echo "   • storage:events:read"
+    echo "   • storage:metrics:read"
+    echo "   • storage:entities:read"
+    echo "   • storage:buckets:read"
+    echo "   • storage:bucket-definitions:read"
+    echo "   • environment-api:problems:read"
+    echo "   • app-engine:apps:run"
+    echo "   • app-engine:edge-connects:read"
+    echo "   • app-settings:objects:read"
+    echo "   • settings:objects:write"
+    echo "   • extensions:definitions:read"
+    echo "   • extensions:configurations:read"
+    echo "   • slo:slos:read"
+    echo "   • document:documents:read"
+    echo "   • automation:workflows:read"
+    echo ""
+    echo "3. Adicione ao seu ~/.zshrc (ou ~/.bashrc):"
+    echo ""
+    echo "   export DYNATRACE_ENV_URL=\"$env_url_display\""
+    echo "   export DYNATRACE_API_TOKEN=\"dt0c01.<seu-token>\""
+    echo "   export DYNATRACE_PLATFORM_TOKEN=\"dt0s16.<seu-token>\"  # opcional"
+    echo "   export DYNATRACE_AUTH_MODE=dql"
+    echo ""
+    echo "4. Recarregue o shell: source ~/.zshrc"
+    echo ""
+    echo "   Ou crie um .env no diretório do projeto com as mesmas variáveis."
+    echo ""
+    echo -e "  \033[1;33m>>> IMPORTANTE: Leia o README.md para detalhes completos <<<\033[0m"
+    echo ""
+    return 1
+  fi
+  return 0
+}
+
+# ── 1b. Validação de sessão AWS SSO ───────────────────────────
+check_aws_session() {
+  if ! command -v aws >/dev/null 2>&1; then
+    print_warn "AWS CLI não encontrada. Investigação AWS não estará disponível."
+    return 0
+  fi
+
+  print_header "Verificando sessão AWS..."
+
+  # Tenta pegar a identidade com qualquer profile disponível
+  local profiles
+  profiles="$(aws configure list-profiles 2>/dev/null)"
+  if [[ -z "$profiles" ]]; then
+    print_warn "Nenhum profile AWS configurado. Investigação AWS não estará disponível."
+    return 0
+  fi
+
+  # Testa se algum profile tem sessão ativa
+  local test_profile session_ok=false
+  for test_profile in $profiles; do
+    if aws sts get-caller-identity --profile "$test_profile" >/dev/null 2>&1; then
+      session_ok=true
+      print_ok "Sessão AWS ativa (profile: $test_profile)"
+      break
+    fi
+  done
+
+  if [[ "$session_ok" == false ]]; then
+    print_err "Nenhuma sessão AWS ativa. O agente não conseguirá consultar logs/métricas."
+    echo ""
+    echo "  Faça login SSO em qualquer profile (a role é compartilhada):"
+    echo ""
+    local first_profile
+    first_profile="$(echo "$profiles" | head -1)"
+    echo -e "  \033[1;33maws sso login --profile $first_profile\033[0m"
+    echo ""
+    echo "  Após login, todos os profiles da mesma org estarão acessíveis."
+    echo ""
+    if [[ -t 0 ]]; then
+      read -r -p "  Deseja fazer login agora? (s/n): " LOGIN_ANSWER
+      if [[ "$LOGIN_ANSWER" =~ ^[sS]$ ]]; then
+        aws sso login --profile "$first_profile"
+        # Re-valida após login
+        if aws sts get-caller-identity --profile "$first_profile" >/dev/null 2>&1; then
+          print_ok "Login SSO realizado com sucesso"
+        else
+          print_err "Login falhou. Tente manualmente: aws sso login --profile $first_profile"
+          return 1
+        fi
+      else
+        print_warn "Continuando sem sessão AWS. Investigação de logs/métricas pode falhar."
+      fi
+    else
+      print_warn "Continuando sem sessão AWS (stdin não interativo)."
+    fi
+  fi
+  return 0
+}
+
+# ── 1c. Pre-fetch: subscription do incidente via Dynatrace API ─
+# Faz uma chamada leve para descobrir a subscription Azure associada ao incidente.
+# Retorna via stdout o subscription UUID (ou vazio se não encontrado).
+_prefetch_incident_subscription() {
+  local query="${1:-}"
+  [[ -z "$query" || -z "${DYNATRACE_ENV_URL:-}" || -z "${DYNATRACE_API_TOKEN:-}" ]] && return 0
+
+  local base_url="${DYNATRACE_ENV_URL%/}"
+  local api_token="$DYNATRACE_API_TOKEN"
+  local problems_url="${base_url}/api/v2/problems?pageSize=5&fields=%2BaffectedEntities&problemSelector=status(%22OPEN%22)"
+
+  # Busca problemas abertos
+  local prob_resp
+  prob_resp="$(curl -sS --max-time 10 -H "Authorization: Api-Token ${api_token}" "$problems_url" 2>/dev/null)" || return 0
+  [[ -z "$prob_resp" ]] && return 0
+
+  # Filtra pelo query no JSON (case-insensitive)
+  local query_lower="${query,,}"
+  if ! echo "$prob_resp" | grep -qi "$query_lower"; then
+    return 0
+  fi
+
+  # Extrai entity IDs (formato SERVICE-xxx, HOST-xxx etc) de qualquer posição no JSON
+  local entity_ids
+  entity_ids="$(echo "$prob_resp" | grep -oP '\b[A-Z_]+-[A-F0-9]{16}\b' | sort -u | head -5)"
+  [[ -z "$entity_ids" ]] && return 0
+
+  # Para cada entity, busca properties e tenta extrair subscription
+  local eid
+  while IFS= read -r eid; do
+    [[ -z "$eid" ]] && continue
+    local entity_resp
+    entity_resp="$(curl -sS --max-time 8 -H "Authorization: Api-Token ${api_token}" \
+      "${base_url}/api/v2/entities/${eid}?fields=%2Bproperties" 2>/dev/null)" || continue
+
+    # Tenta azureSubscriptionUuid
+    local sub_uuid
+    sub_uuid="$(echo "$entity_resp" | grep -oP '"azureSubscriptionUuid"\s*:\s*"\K[0-9a-f-]{36}' | head -1)"
+    if [[ -n "$sub_uuid" ]]; then
+      echo "$sub_uuid"
+      return 0
+    fi
+
+    # Tenta extrair de publicCloudId (/subscriptions/<uuid>/...)
+    sub_uuid="$(echo "$entity_resp" | grep -oP '/subscriptions/\K[0-9a-f-]{36}' | head -1)"
+    if [[ -n "$sub_uuid" ]]; then
+      echo "$sub_uuid"
+      return 0
+    fi
+  done <<< "$entity_ids"
+
+  return 0
+}
+
+# ── 1d. Validação de sessão Azure ─────────────────────────────
+check_azure_session() {
+  if ! command -v az >/dev/null 2>&1; then
+    print_warn "Azure CLI (az) não encontrada. Investigação Azure não estará disponível."
+    return 0
+  fi
+
+  print_header "Verificando sessão Azure..."
+
+  # Verifica se há sessão ativa E se o token é válido (get-access-token força renovação real)
+  local az_account
+  az_account="$(az account show --output json 2>/dev/null)" || az_account=""
+
+  # Mesmo com account show OK, valida que o token realmente funciona
+  if [[ -n "$az_account" ]]; then
+    if ! az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+      # Token expirado — limpa e força relogin
+      az_account=""
+    fi
+  fi
+
+  if [[ -z "$az_account" ]]; then
+    print_err "Nenhuma sessão Azure ativa."
+    echo ""
+    echo "  Faça login:"
+    echo ""
+    echo -e "  \033[1;33maz login\033[0m"
+    echo ""
+    if [[ -t 0 ]]; then
+      read -r -p "  Deseja fazer login agora? (s/n): " AZ_LOGIN_ANSWER
+      if [[ "$AZ_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
+        az login
+        az_account="$(az account show --output json 2>/dev/null)" || az_account=""
+        if [[ -z "$az_account" ]]; then
+          print_err "Login Azure falhou. Tente manualmente: az login"
+          return 1
+        fi
+        print_ok "Login Azure realizado com sucesso"
+      else
+        print_warn "Continuando sem sessão Azure. Investigação Azure pode falhar."
+        return 0
+      fi
+    else
+      print_warn "Continuando sem sessão Azure (stdin não interativo)."
+      return 0
+    fi
+  fi
+
+  # Extrai informações da subscription ativa
+  local sub_name sub_id
+  sub_name="$(echo "$az_account" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -1)"
+  sub_id="$(echo "$az_account" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1)"
+  print_ok "Sessão Azure ativa (subscription: $sub_name)"
+
+  # Exporta para o Python usar na enrichment
+  export AZURE_SUBSCRIPTION_ID="$sub_id"
+  export AZURE_SUBSCRIPTION_NAME="$sub_name"
+
+  # Pre-fetch: descobre subscription do incidente via Dynatrace API
+  local incident_sub=""
+  local user_query=""
+  # Extrai query: se $1 não começa com --, é a query; senão busca --query <val>
+  if [[ -n "${REMAINING_ARGS[0]:-}" && "${REMAINING_ARGS[0]}" != --* ]]; then
+    user_query="${REMAINING_ARGS[0]}"
+  else
+    local _i
+    for _i in "${!REMAINING_ARGS[@]}"; do
+      if [[ "${REMAINING_ARGS[$_i]}" == "--query" && -n "${REMAINING_ARGS[$((_i+1))]:-}" ]]; then
+        user_query="${REMAINING_ARGS[$((_i+1))]}"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$user_query" ]]; then
+    incident_sub="$(_prefetch_incident_subscription "$user_query")"
+  fi
+
+  if [[ -n "$incident_sub" ]]; then
+    if [[ "$incident_sub" == "$sub_id" ]]; then
+      # Subscription do incidente == ativa → segue sem perguntar
+      return 0
+    fi
+
+    # Subscription do incidente difere da ativa → resolve nome e oferece troca
+    local incident_sub_name=""
+    incident_sub_name="$(az account list --query "[?id=='$incident_sub'].name" -o tsv 2>/dev/null | head -1)"
+    [[ -z "$incident_sub_name" ]] && incident_sub_name="$incident_sub"
+
+    if [[ -t 0 ]]; then
+      echo ""
+      echo "  Subscription do incidente: $incident_sub_name ($incident_sub)"
+      echo "  Subscription ativa:        $sub_name ($sub_id)"
+      echo ""
+      read -r -p "  Deseja trocar para a subscription do incidente? (s/n): " AZ_SUB_ANSWER
+      if [[ "$AZ_SUB_ANSWER" =~ ^[sS]$ ]]; then
+        az account set --subscription "$incident_sub" 2>/dev/null
+        export AZURE_SUBSCRIPTION_ID="$incident_sub"
+        export AZURE_SUBSCRIPTION_NAME="$incident_sub_name"
+        print_ok "Subscription alterada: $incident_sub_name"
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+# ── 1e. Seleção de cloud provider ─────────────────────────────
+select_cloud_provider() {
+  # Se já veio via --cloud=, não pergunta
+  if [[ -n "${SELECTED_CLOUD:-}" ]]; then
+    print_ok "Cloud provider: ${SELECTED_CLOUD}"
+    return 0
+  fi
+
+  # Se stdin não é terminal (pipe/redirect), assume aws como padrão
+  if [[ ! -t 0 ]]; then
+    SELECTED_CLOUD="aws"
+    return 0
+  fi
+
+  print_header "Seleção de cloud provider..."
+  echo ""
+  echo "  1) aws      — Amazon Web Services"
+  echo "  2) azure    — Microsoft Azure"
+  echo -e "  3) gcp      — Google Cloud Platform - \033[0;31mAINDA SEM MCP e regras de login\033[0m"
+  echo "  4) todas    — Validar AWS + Azure"
+  echo ""
+  read -r -p "  Cloud preferencial [1-4] (default: 4): " cloud_choice
+
+  case "${cloud_choice:-4}" in
+    1) SELECTED_CLOUD="aws" ;;
+    2) SELECTED_CLOUD="azure" ;;
+    3) SELECTED_CLOUD="gcp" ;;
+    4|"") SELECTED_CLOUD="todas" ;;
+    aws|azure|gcp|todas) SELECTED_CLOUD="$cloud_choice" ;;
+    *) SELECTED_CLOUD="todas" ;;
+  esac
+
+  print_ok "Cloud provider: ${SELECTED_CLOUD}"
+}
+
+# ── 1e. Validação de sessões cloud (conforme seleção) ──────────
+check_cloud_sessions() {
+  case "${SELECTED_CLOUD:-todas}" in
+    aws)
+      check_aws_session
+      ;;
+    azure)
+      check_azure_session
+      ;;
+    gcp)
+      print_warn "Validação GCP ainda não implementada."
+      ;;
+    todas)
+      check_aws_session
+      check_azure_session
+      ;;
+  esac
+
+  # Exporta para o Python saber qual cloud foi selecionada
+  export PREFERRED_CLOUD="${SELECTED_CLOUD:-todas}"
+}
+
+# ── 2. Bootstrap do workspace de incidentes (Copilot) ──────────
+bootstrap_incidents_workspace() {
+  local templates_dir="$ROOT_DIR/templates"
+  local needs_sync=false
+
+  # Verifica se os templates existem no projeto
+  if [[ ! -d "$templates_dir" ]]; then
+    print_warn "Diretório templates/ não encontrado em $ROOT_DIR"
+    return 0
+  fi
+
+  # Mapeamento: diretórios visíveis na origem → ocultos no destino
+  # templates/github/  → ~/Documents/incidentes/.github/
+  # templates/vscode/  → ~/Documents/incidentes/.vscode/
+  # templates/mcp/     → ~/Documents/incidentes/.mcp/
+  map_dest_path() {
+    local rel="$1"
+    rel="${rel/#github\//.github/}"
+    rel="${rel/#vscode\//.vscode/}"
+    rel="${rel/#mcp\//.mcp/}"
+    echo "$rel"
+  }
+
+  # Verifica se precisa sincronizar (arquivos ausentes ou desatualizados)
+  while IFS= read -r -d '' tpl; do
+    local rel="${tpl#$templates_dir/}"
+    local dest="$INCIDENTS_BASE/$(map_dest_path "$rel")"
+    if [[ ! -f "$dest" ]] || ! cmp -s "$tpl" "$dest"; then
+      needs_sync=true
+      break
+    fi
+  done < <(find "$templates_dir" -type f -print0)
+
+  if [[ "$needs_sync" == false ]]; then
+    return 0
+  fi
+
+  print_header "Preparando workspace de incidentes..."
+
+  # Copia toda a estrutura de templates para o workspace (renomeando dirs ocultos)
+  while IFS= read -r -d '' tpl; do
+    local rel="${tpl#$templates_dir/}"
+    local dest="$INCIDENTS_BASE/$(map_dest_path "$rel")"
+    mkdir -p "$(dirname "$dest")"
+    cp "$tpl" "$dest"
+    print_ok "Sincronizado: $(map_dest_path "$rel")"
+  done < <(find "$templates_dir" -type f -print0)
+
+  # Garante que o MCP server é executável
+  if [[ -f "$INCIDENTS_BASE/.mcp/sre-readonly.sh" ]]; then
+    chmod +x "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+  fi
+
+  print_ok "Workspace pronto: $INCIDENTS_BASE"
+}
+
+# ── 3. Setup dtctl (CLI Dynatrace) ─────────────────────────────
+setup_dtctl() {
+  # Detecta ambiente sem keyring (WSL, containers, CI)
+  local is_headless=false
+  if [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSLENV:-}" ]] || \
+     [[ "$(uname -r 2>/dev/null)" == *microsoft* ]] || \
+     [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]] || \
+     [[ -n "${CI:-}" ]] || [[ -n "${CODESPACES:-}" ]]; then
+    is_headless=true
+  fi
+
+  # Em headless: SEMPRE setar file storage ANTES de qualquer operação dtctl
+  if [[ "$is_headless" == true ]]; then
+    export DTCTL_TOKEN_STORAGE=file
+    _persist_dtctl_env "DTCTL_TOKEN_STORAGE=file"
+  fi
+
+  if command -v dtctl >/dev/null 2>&1; then
+    print_ok "dtctl encontrado: $(command -v dtctl)"
+
+    # Em headless: reconfigura se doctor falha sem o context switch
+    if [[ "$is_headless" == true ]]; then
+      if ! timeout 10 dtctl doctor >/dev/null 2>&1; then
+        print_warn "Ambiente headless/WSL — keyring indisponível. Reconfigurando com file storage..."
+      fi
+    fi
+
+    # Sempre garantir que o contexto aponta para o tenant selecionado
+    _configure_dtctl_context
+    return 0
+  fi
+
+  # dtctl não instalado — perguntar ao usuário
+  echo ""
+  print_warn "dtctl (CLI Dynatrace) não encontrado."
+  echo ""
+  echo "  O dtctl permite consultas avançadas (DQL, entities, métricas)"
+  echo "  e é usado pelo agente Copilot para investigação automatizada."
+  echo ""
+  read -r -p "  Deseja instalar o dtctl agora? (s/n): " INSTALL_ANSWER
+
+  if [[ ! "$INSTALL_ANSWER" =~ ^[sS]$ ]]; then
+    print_warn "Pulando instalação do dtctl. Algumas funcionalidades estarão limitadas."
+    return 0
+  fi
+
+  # Instalação
+  print_header "Instalando dtctl..."
+  echo "  Baixando installer oficial do repositório dtctl..."
+
+  local install_script
+  install_script="$(mktemp)"
+  trap "rm -f '$install_script'" RETURN
+
+  if ! curl -fsSL --retry 3 --retry-delay 2 -o "$install_script" \
+       "https://raw.githubusercontent.com/dynatrace-oss/dtctl/main/install.sh" 2>/dev/null; then
+    print_err "Falha no download do installer."
+    echo ""
+    echo "  Tente manualmente:"
+    echo "    curl -fsSL https://raw.githubusercontent.com/dynatrace-oss/dtctl/main/install.sh | sh"
+    echo ""
+    echo "  Se o erro persistir (SSL/proxy), baixe direto:"
+    echo "    https://github.com/dynatrace-oss/dtctl/releases/latest"
+    rm -f "$install_script"
+    return 1
+  fi
+
+  chmod +x "$install_script"
+  if ! sh "$install_script"; then
+    print_err "Falha na execução do installer."
+    echo "  Tente manualmente: sh $install_script"
+    return 1
+  fi
+  rm -f "$install_script"
+
+  # Garante que está no PATH (install.sh coloca em ~/.local/bin ou /usr/local/bin)
+  export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+  if ! command -v dtctl >/dev/null 2>&1; then
+    print_err "Instalação concluiu mas dtctl não encontrado no PATH."
+    echo "  Verifique se ~/.local/bin está no PATH:"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+    return 1
+  fi
+  print_ok "dtctl instalado com sucesso: $(command -v dtctl)"
+
+  _configure_dtctl_context
+}
+
+# Configura o contexto dtctl com a env URL do Dynatrace
+_configure_dtctl_context() {
+  local env_url="${DYNATRACE_ENV_URL:-}"
+  if [[ -z "$env_url" ]]; then
+    print_warn "DYNATRACE_ENV_URL não definida — configure o dtctl manualmente"
+    return 0
+  fi
+
+  # Extrai tenant ID da URL (ex: <tenant-id> de https://<tenant-id>.live.dynatrace.com)
+  local tenant_id
+  tenant_id="$(echo "$env_url" | sed -E 's|https?://([^.]+)\..*|\1|')"
+
+  # 1. Busca contexto existente cuja environment contenha o mesmo tenant ID
+  local config_file="${HOME}/.config/dtctl/config"
+  if [[ -f "$config_file" ]]; then
+    local existing_ctx=""
+    existing_ctx="$(awk -v tid="$tenant_id" '
+      /- name:/ { ctx=$NF }
+      /environment:/ && $0 ~ tid { print ctx; exit }
+    ' "$config_file")"
+
+    if [[ -n "$existing_ctx" ]]; then
+      local current_ctx
+      current_ctx="$(dtctl config current-context 2>/dev/null || true)"
+      if [[ "$current_ctx" != "$existing_ctx" ]]; then
+        dtctl config use-context "$existing_ctx" 2>/dev/null || true
+        print_ok "dtctl context: '$existing_ctx' (tenant $tenant_id)"
+      fi
+      # Valida com query real (doctor NÃO valida token OAuth expirado)
+      local _dtctl_test
+      _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+      if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+        print_ok "dtctl: OK (query validada)"
+        return 0
+      fi
+      # OAuth expirado — tenta reparar com platform token se disponível
+      local token="${DYNATRACE_PLATFORM_TOKEN:-${DYNATRACE_API_TOKEN:-}}"
+      if [[ -n "$token" ]]; then
+        local token_ref
+        token_ref="$(grep -A5 "name: ${existing_ctx}$" "$config_file" 2>/dev/null | grep 'token-ref:' | head -1 | awk '{print $2}' || true)"
+        if [[ -n "$token_ref" ]]; then
+          dtctl config set-credentials "$token_ref" --token "$token" 2>/dev/null || true
+          _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+          if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+            print_ok "dtctl: OK (token reparado)"
+            return 0
+          fi
+        fi
+      fi
+      print_warn "dtctl context '$existing_ctx' — token SSO expirado."
+      echo ""
+      echo -e "  \033[1;33mdtctl auth login\033[0m"
+      echo ""
+      if [[ -t 0 ]]; then
+        read -r -p "  Deseja fazer login agora? (s/n): " DTCTL_LOGIN_ANSWER
+        if [[ "$DTCTL_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
+          dtctl auth login
+          _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+          if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+            print_ok "dtctl: OK (login realizado)"
+            return 0
+          else
+            print_err "Login dtctl falhou. Tente manualmente: dtctl auth login"
+          fi
+        else
+          print_warn "Continuando sem dtctl autenticado. Análise via DQL pode falhar."
+        fi
+      fi
+      return 0
+    fi
+  fi
+
+  # 2. Nenhum contexto existente — cria novo baseado no tenant
+  local token="${DYNATRACE_PLATFORM_TOKEN:-${DYNATRACE_API_TOKEN:-}}"
+  if [[ -z "$token" ]]; then
+    print_warn "Nenhum token disponível e nenhum contexto dtctl configurado para $tenant_id"
+    print_warn "Execute: dtctl auth login --context $tenant_id --environment \"${env_url%.live.*}.apps.dynatrace.com\""
+    return 0
+  fi
+
+  local context_name="$tenant_id"
+  local token_ref="${context_name}-token"
+
+  print_header "Configurando dtctl context '$context_name'..."
+
+  # Para dtctl DQL, usa .apps. ao invés de .live.
+  local apps_url="${env_url//.live.dynatrace.com/.apps.dynatrace.com}"
+
+  dtctl config set-context "$context_name" \
+    --environment "$apps_url" \
+    --token-ref "$token_ref" 2>/dev/null || true
+
+  dtctl config set-credentials "$token_ref" \
+    --token "$token" 2>/dev/null || true
+
+  dtctl config use-context "$context_name" 2>/dev/null || true
+
+  # Valida
+  if timeout 10 dtctl doctor >/dev/null 2>&1; then
+    print_ok "dtctl doctor: OK"
+  else
+    print_warn "dtctl doctor reportou problemas — recomenda-se:"
+    print_warn "  dtctl auth login --context $context_name --environment \"$apps_url\""
+  fi
+}
+
+# Persiste variável de ambiente no shell profile do usuário
+_persist_dtctl_env() {
+  local entry="$1"
+  local shell_rc=""
+
+  if [[ -f "$HOME/.zshrc" ]]; then
+    shell_rc="$HOME/.zshrc"
+  elif [[ -f "$HOME/.bashrc" ]]; then
+    shell_rc="$HOME/.bashrc"
+  fi
+
+  if [[ -n "$shell_rc" ]] && ! grep -qF "$entry" "$shell_rc" 2>/dev/null; then
+    echo "" >> "$shell_rc"
+    echo "# dtctl: token storage para ambiente headless/WSL" >> "$shell_rc"
+    echo "export $entry" >> "$shell_rc"
+    print_ok "Adicionado 'export $entry' em $shell_rc"
+  fi
+}
+
+# ── 4. Preparação do Python venv ───────────────────────────────
+setup_python() {
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_CMD="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_CMD="python"
+  else
+    print_err "Python não encontrado no PATH (python3/python)."
+    echo ""
+    echo "  Instale o Python 3:"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      echo "    brew install python3"
+    else
+      echo "    sudo apt install python3 python3-venv python3-pip  (Debian/Ubuntu/WSL)"
+      echo "    sudo dnf install python3 python3-pip               (Fedora/RHEL)"
+    fi
+    exit 1
+  fi
+
+  if [[ ! -x "$VENV_PYTHON" || ! -x "$VENV_PIP" ]]; then
+    print_header "Criando ambiente virtual Python..."
+    rm -rf "$PERSISTENT_VENV"
+    mkdir -p "$(dirname "$PERSISTENT_VENV")"
+
+    if ! "$PYTHON_CMD" -m venv "$PERSISTENT_VENV" >/dev/null 2>&1; then
+      if command -v virtualenv >/dev/null 2>&1; then
+        virtualenv -p "$PYTHON_CMD" "$PERSISTENT_VENV" >/dev/null 2>&1
+      else
+        print_err "Falha ao criar venv."
+        echo ""
+        echo "  O módulo 'venv' não está disponível. Instale:"
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+          echo "    brew install python3   (já inclui venv no macOS)"
+        else
+          echo "    sudo apt install python3-venv   (Debian/Ubuntu/WSL)"
+          echo "    sudo dnf install python3-pip    (Fedora/RHEL)"
+        fi
+        echo ""
+        echo "  Ou instale virtualenv como alternativa:"
+        echo "    pip3 install --user virtualenv"
+        exit 1
+      fi
+    fi
+
+    if [[ ! -x "$PERSISTENT_VENV/bin/python" ]]; then
+      print_err "venv criado sem bin/python."
+      echo ""
+      echo "  Isso geralmente indica python3-venv incompleto."
+      if [[ "$(uname -s)" != "Darwin" ]]; then
+        echo "  Execute: sudo apt install python3-venv"
+      fi
+      exit 1
+    fi
+    print_ok "venv criado em $PERSISTENT_VENV"
+  fi
+
+  if [[ ! -x "$VENV_PIP" ]]; then
+    "$VENV_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+
+  if [[ ! -f "$REQ_SNAPSHOT" ]] || ! cmp -s "$REQ_FILE" "$REQ_SNAPSHOT"; then
+    if [[ ! -x "$VENV_PIP" ]]; then
+      print_err "pip não disponível no venv."
+      echo ""
+      echo "  Reinstale o venv ou instale pip:"
+      if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "    brew reinstall python3"
+      else
+        echo "    sudo apt install python3-pip python3-venv"
+      fi
+      exit 1
+    fi
+    print_header "Instalando dependências..."
+    "$VENV_PYTHON" -m pip install --quiet --upgrade pip
+    "$VENV_PYTHON" -m pip install --quiet -r "$REQ_FILE"
+    cp "$REQ_FILE" "$REQ_SNAPSHOT"
+    print_ok "Dependências instaladas"
+  fi
+}
+
+# ── 5. Uso ──────────────────────────────────────────────────────
+show_usage() {
+  echo "Uso: view_dyna_incidents <query> [opções]"
+  echo ""
+  echo "⏱️  Janela padrão: últimos 5 minutos (sem --window busca incidentes recentes)"
+  echo "    Para ampliar, use --window=1h ou --window=6h"
+  echo ""
+  echo "Exemplos:"
+  echo "  view_dyna_incidents credit                  # últimos 5 min (padrão)"
+  echo "  view_dyna_incidents credit --window=1h      # última 1 hora"
+  echo "  view_dyna_incidents cdc --window=30m        # últimos 30 min"
+  echo "  view_dyna_incidents cdc --from=\"01-05-2026 10h\" --to=\"01-05-2026 12h\""
+  echo "  view_dyna_incidents --diagnose"
+  echo "  view_dyna_incidents gateway --help"
+  echo ""
+  echo "Opções:"
+  echo "  --env=AMBIENTE       Seleciona ambiente (ex: tenant_a, tenant_b)"
+  echo "  --cloud=PROVIDER     Seleciona cloud (aws, azure, gcp, todas)"
+  echo "  --window=TEMPO       Janela relativa (ex: 10m, 2h, 1d)"
+  echo "  --from=INICIO        Inicio do intervalo (ex: \"01-05-2026 10h\")"
+  echo "  --to=FIM             Fim do intervalo (ex: \"01-05-2026 12h\")"
+  echo "  --json               Saída em JSON"
+  echo "  --executive          Resumo executivo para Slack/Teams"
+  echo "  --diagnose           Diagnóstico de tokens e conectividade"
+  echo "  --no-dtctl           Desabilita enriquecimento via dtctl"
+  echo "  --help               Mostra ajuda do Python (argumentos detalhados)"
+  exit 1
+}
+
+# ── MAIN ────────────────────────────────────────────────────────
+
+if [[ $# -lt 1 ]]; then
+  show_usage
+fi
+
+# Se é --help/-h, executa direto no Python sem setup pesado
+for arg in "$@"; do
+  if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+    cd "$ROOT_DIR"
+    setup_python
+    if [[ "$1" == --* ]]; then
+      "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "$@"
+    else
+      "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${@:2}"
+    fi
+    exit $?
+  fi
+done
+
+cd "$ROOT_DIR"
+
+# Carrega .env sem sobrescrever variáveis já exportadas
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+    key="$(echo "$key" | xargs)"
+    [[ -z "$key" ]] && continue
+    value="${value%%#*}"
+    value="$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    value="${value%\"}"
+    value="${value#\"}"
+    if [[ -z "${!key-}" && -n "$value" ]]; then
+      export "$key=$value"
+    fi
+  done < "$ROOT_DIR/.env"
+fi
+
+# Multi-tenant: se existem variáveis sufixadas, IGNORA a genérica do .env
+# para forçar a seleção interativa de ambiente
+_source_dynatrace_vars
+_detect_dynatrace_envs
+if [[ ${#DETECTED_ENVS[@]} -gt 1 ]]; then
+  # Limpa variáveis genéricas para forçar seleção
+  unset DYNATRACE_ENV_URL DYNATRACE_API_TOKEN DYNATRACE_PLATFORM_TOKEN 2>/dev/null || true
+fi
+
+# Processa --env=<label> e --cloud=<provider> antes da validação de tokens
+REMAINING_ARGS=()
+SELECTED_CLOUD=""
+for arg in "$@"; do
+  if [[ "$arg" == --env=* ]]; then
+    _load_dynatrace_env "${arg#--env=}"
+  elif [[ "$arg" == --cloud=* ]]; then
+    SELECTED_CLOUD="${arg#--cloud=}"
+    SELECTED_CLOUD="${SELECTED_CLOUD,,}"  # lowercase
+  else
+    REMAINING_ARGS+=("$arg")
+  fi
+done
+set -- "${REMAINING_ARGS[@]}"
+
+# Validação de tokens
+check_tokens || exit 1
+
+# Seleção de cloud provider (após tenant)
+select_cloud_provider
+
+# Validação de sessões cloud (conforme seleção)
+check_cloud_sessions
+
+# Setup dtctl (instala e configura se necessário)
+setup_dtctl
+
+# Setup automático
+setup_python
+bootstrap_incidents_workspace
+
+# ── Execução ────────────────────────────────────────────────────
+COPILOT_TMPOUT="$(mktemp)"
+trap 'stop_spinner; rm -f "$COPILOT_TMPOUT"' EXIT
+
+# Timeout máximo para a consulta — lido de config.ini
+MAX_QUERY_TIMEOUT="$CFG_QUERY_TIMEOUT"
+
+# Detecta se o usuário passou --window ou --from explicitamente
+_has_custom_window=false
+for _a in "$@"; do
+  [[ "$_a" == --window* || "$_a" == --from* ]] && _has_custom_window=true
+done
+
+# Informa a janela de pesquisa
+if [[ "$_has_custom_window" == true ]]; then
+  start_spinner "Consultando Dynatrace..."
+else
+  echo "  ℹ️  Janela padrão: últimos ${CFG_WINDOW} (use --window=1h para ampliar)"
+  start_spinner "Consultando Dynatrace (últimos ${CFG_WINDOW})..."
+fi
+
+if [[ "$1" == --* ]]; then
+  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "$@" > "$COPILOT_TMPOUT" 2>&1
+  PYTHON_EXIT=$?
+else
+  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${@:2}" > "$COPILOT_TMPOUT" 2>&1
+  PYTHON_EXIT=$?
+fi
+
+# Se timeout (exit 124), avisa o usuário
+if [[ $PYTHON_EXIT -eq 124 ]]; then
+  stop_spinner
+  echo ""
+  print_warn "Timeout (${MAX_QUERY_TIMEOUT}s) — tente reduzir a janela: --window=5m"
+  exit 1
+fi
+
+stop_spinner
+
+# Exibe a saída capturada
+if [[ -s "$COPILOT_TMPOUT" ]]; then
+  cat "$COPILOT_TMPOUT"
+fi
+
+# Se houve erro ou saída vazia, sai sem perguntar
+if [[ $PYTHON_EXIT -ne 0 ]] || [[ ! -s "$COPILOT_TMPOUT" ]]; then
+  exit ${PYTHON_EXIT:-1}
+fi
+
+# Se nenhum incidente foi encontrado, sai sem oferecer Copilot
+if grep -q "Nenhum incidente aberto encontrado" "$COPILOT_TMPOUT"; then
+  exit 0
+fi
+
+# ── Integração Copilot ──────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+read -r -p "🤖 Deseja análise AI pelo GitHub Copilot? (s/n): " COPILOT_ANSWER
+
+if [[ "$COPILOT_ANSWER" =~ ^[sS]$ ]]; then
+  QUERY_USED="${1:-}"
+  [[ "$QUERY_USED" == --* ]] && QUERY_USED="query"
+
+  # Verifica dependências de PDF
+  _check_pdf_deps || true
+
+  # Extrai workloads alarmados da saída
+  WORKLOADS=()
+  while IFS= read -r wl; do
+    clean=$(echo "$wl" | sed -E 's/\s*\[.*\]\s*$//' | xargs | tr -c '[:alnum:]._-' '_' | sed 's/_*$//')
+    [[ -n "$clean" ]] && WORKLOADS+=("$clean")
+  done < <(sed -nE 's/^[[:space:]]*Workload[[:space:]]*:[[:space:]]*(.*)/\1/p' "$COPILOT_TMPOUT")
+
+  [[ ${#WORKLOADS[@]} -eq 0 ]] && WORKLOADS=("${QUERY_USED}")
+
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
+  # Detecta VS Code CLI
+  VSCODE_CMD=""
+  command -v code >/dev/null 2>&1 && VSCODE_CMD="code"
+  [[ -z "$VSCODE_CMD" ]] && command -v code-insiders >/dev/null 2>&1 && VSCODE_CMD="code-insiders"
+
+  # Cria arquivo para cada workload
+  CREATED_FILES=()
+  for wl in "${WORKLOADS[@]}"; do
+    INCIDENT_DIR="$INCIDENTS_BASE/$wl/data"
+    mkdir -p "$INCIDENT_DIR"
+    COPILOT_FILE="$INCIDENT_DIR/${TIMESTAMP}_analysis.md"
+
+    cat > "$COPILOT_FILE" <<COPILOT_EOF
+# Dynatrace Incident Analysis - ${wl}
+
+> **Dados coletados automaticamente do Dynatrace.**
+> O campo \`Root Cause\` indica o serviço que ORIGINA os erros (pode estar em outra conta AWS).
+> O campo \`Cloud ID\` indica o serviço que REPORTA os erros (caller).
+> Use o prompt \`analisar-incidente\` para investigação completa com comandos AWS.
+
+---
+
+## Dados coletados do Dynatrace
+
+\`\`\`
+$(cat "$COPILOT_TMPOUT")
+\`\`\`
+COPILOT_EOF
+
+    CREATED_FILES+=("$COPILOT_FILE")
+    echo "📄 $COPILOT_FILE"
+
+    # Gera PDF do relatório
+    _generate_pdf "$COPILOT_FILE"
+  done
+
+  echo ""
+
+  if [[ -z "$VSCODE_CMD" ]]; then
+    print_warn "VS Code CLI (code) não encontrado no PATH."
+    echo "   Abra manualmente: $INCIDENTS_BASE"
+  else
+    # Verifica e corrige integridade do MCP antes de abrir
+    mcp_ok=true
+
+    # 1. Garante .vscode/mcp.json
+    if [[ ! -f "$INCIDENTS_BASE/.vscode/mcp.json" ]]; then
+      print_warn ".vscode/mcp.json ausente — recriando..."
+      mkdir -p "$INCIDENTS_BASE/.vscode"
+      cat > "$INCIDENTS_BASE/.vscode/mcp.json" <<'MCP_EOF'
+{
+  "servers": {
+    "sre-readonly": {
+      "type": "stdio",
+      "command": "bash",
+      "args": ["${workspaceFolder}/.mcp/sre-readonly.sh"],
+      "env": {}
+    }
+  }
+}
+MCP_EOF
+      print_ok ".vscode/mcp.json recriado"
+    fi
+
+    # 2. Garante .mcp/sre-readonly.sh executável e atualizado
+    if [[ -f "$ROOT_DIR/templates/mcp/sre-readonly.sh" ]]; then
+      mkdir -p "$INCIDENTS_BASE/.mcp"
+      if [[ ! -f "$INCIDENTS_BASE/.mcp/sre-readonly.sh" ]]; then
+        cp "$ROOT_DIR/templates/mcp/sre-readonly.sh" "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+        chmod +x "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+        print_ok ".mcp/sre-readonly.sh instalado"
+      elif ! diff -q "$ROOT_DIR/templates/mcp/sre-readonly.sh" "$INCIDENTS_BASE/.mcp/sre-readonly.sh" >/dev/null 2>&1; then
+        cp "$ROOT_DIR/templates/mcp/sre-readonly.sh" "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+        chmod +x "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+        print_ok ".mcp/sre-readonly.sh atualizado (nova versão)"
+      fi
+      [[ ! -x "$INCIDENTS_BASE/.mcp/sre-readonly.sh" ]] && chmod +x "$INCIDENTS_BASE/.mcp/sre-readonly.sh"
+    else
+      if [[ ! -f "$INCIDENTS_BASE/.mcp/sre-readonly.sh" ]]; then
+        print_err "Falta .mcp/sre-readonly.sh e template não encontrado!"
+        mcp_ok=false
+      fi
+    fi
+
+    # 3. Garante .github/agents/analisar-incidente.agent.md atualizado
+    if [[ -f "$ROOT_DIR/templates/github/agents/analisar-incidente.agent.md" ]]; then
+      mkdir -p "$INCIDENTS_BASE/.github/agents"
+      if [[ ! -f "$INCIDENTS_BASE/.github/agents/analisar-incidente.agent.md" ]]; then
+        cp "$ROOT_DIR/templates/github/agents/analisar-incidente.agent.md" "$INCIDENTS_BASE/.github/agents/"
+        print_ok "Agent instalado"
+      elif ! diff -q "$ROOT_DIR/templates/github/agents/analisar-incidente.agent.md" "$INCIDENTS_BASE/.github/agents/analisar-incidente.agent.md" >/dev/null 2>&1; then
+        cp "$ROOT_DIR/templates/github/agents/analisar-incidente.agent.md" "$INCIDENTS_BASE/.github/agents/"
+        print_ok "Agent atualizado (nova versão)"
+      fi
+    else
+      if [[ ! -f "$INCIDENTS_BASE/.github/agents/analisar-incidente.agent.md" ]]; then
+        print_err "Falta agent.md e template não encontrado!"
+        mcp_ok=false
+      fi
+    fi
+
+    # 3b. Garante .github/copilot-instructions.md atualizado
+    if [[ -f "$ROOT_DIR/templates/github/copilot-instructions.md" ]]; then
+      mkdir -p "$INCIDENTS_BASE/.github"
+      if [[ ! -f "$INCIDENTS_BASE/.github/copilot-instructions.md" ]]; then
+        cp "$ROOT_DIR/templates/github/copilot-instructions.md" "$INCIDENTS_BASE/.github/"
+        print_ok "copilot-instructions.md instalado"
+      elif ! diff -q "$ROOT_DIR/templates/github/copilot-instructions.md" "$INCIDENTS_BASE/.github/copilot-instructions.md" >/dev/null 2>&1; then
+        cp "$ROOT_DIR/templates/github/copilot-instructions.md" "$INCIDENTS_BASE/.github/"
+        print_ok "copilot-instructions.md atualizado (nova versão)"
+      fi
+    fi
+
+    # 4. Garante settings.json com configurações necessárias
+    if [[ ! -f "$INCIDENTS_BASE/.vscode/settings.json" ]]; then
+      mkdir -p "$INCIDENTS_BASE/.vscode"
+      cat > "$INCIDENTS_BASE/.vscode/settings.json" <<'SETTINGS_EOF'
+{
+    "chat.mcp.discovery.enabled": true,
+    "chat.mcp.autoStart": true,
+    "github.copilot.chat.agent.disabledTools": [
+        "run_in_terminal"
+    ]
+}
+SETTINGS_EOF
+      print_ok ".vscode/settings.json criado (MCP discovery + autoStart + terminal desabilitado para Copilot)"
+    else
+      settings_changed=false
+      if ! grep -q "chat.mcp.discovery.enabled" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
+        sed -i '$ s/}/,\n    "chat.mcp.discovery.enabled": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        settings_changed=true
+      fi
+      if ! grep -q "chat.mcp.autoStart" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
+        sed -i '$ s/}/,\n    "chat.mcp.autoStart": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        settings_changed=true
+      fi
+      if ! grep -q "github.copilot.chat.agent.disabledTools" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
+        sed -i '$ s/}/,\n    "github.copilot.chat.agent.disabledTools": [\n        "run_in_terminal"\n    ]\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        settings_changed=true
+      fi
+      if [[ "$settings_changed" == true ]]; then
+        print_ok "settings.json atualizado (MCP discovery + autoStart + terminal desabilitado para Copilot)"
+      fi
+    fi
+
+    if [[ "$mcp_ok" == false ]]; then
+      print_warn "Execute novamente para sincronizar os templates, ou rode: view_dyna_incidents --diagnose"
+    fi
+
+    # Revalida sessões cloud antes de abrir VS Code (tokens podem ter expirado durante a coleta)
+    if [[ "${SELECTED_CLOUD:-todas}" == "azure" || "${SELECTED_CLOUD:-todas}" == "todas" ]]; then
+      if command -v az >/dev/null 2>&1; then
+        # Usa get-access-token para forçar renovação real (account show pode usar cache)
+        if ! az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+          echo ""
+          print_warn "Sessão Azure expirou durante a coleta. Faça login antes de usar o agente."
+          echo ""
+          echo -e "  \033[1;33maz login\033[0m"
+          echo ""
+          if [[ -t 0 ]]; then
+            read -r -p "  Deseja fazer login agora? (s/n): " AZ_RELOGIN
+            if [[ "$AZ_RELOGIN" =~ ^[sS]$ ]]; then
+              az login
+              if az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+                print_ok "Sessão Azure renovada"
+                # Garante subscription correta
+                if [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]]; then
+                  az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+                fi
+              else
+                print_err "Login Azure falhou. O agente pode encontrar erros de autenticação."
+              fi
+            else
+              print_err "Sessão Azure expirada. O agente VAI falhar com AUTH_EXPIRED."
+              echo "  Execute: az login"
+              echo ""
+              read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_ANYWAY
+              if [[ ! "$OPEN_ANYWAY" =~ ^[sS]$ ]]; then
+                echo "  Abortando. Faça az login e execute novamente."
+                exit 1
+              fi
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    # Revalida dtctl antes de abrir VS Code (query real, não apenas doctor)
+    if command -v dtctl >/dev/null 2>&1; then
+      # dtctl doctor verifica config mas NÃO valida se o token OAuth está expirado.
+      # Uma query leve "fetch dt.entity.host | limit 1" é a única forma confiável.
+      dtctl_test_output="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || dtctl_test_output=""
+      if echo "$dtctl_test_output" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+        echo ""
+        print_warn "Token dtctl SSO expirado. Faça login antes de usar o agente."
+        echo ""
+        echo -e "  \033[1;33mdtctl auth login\033[0m"
+        echo ""
+        if [[ -t 0 ]]; then
+          read -r -p "  Deseja fazer login agora? (s/n): " DTCTL_RELOGIN
+          if [[ "$DTCTL_RELOGIN" =~ ^[sS]$ ]]; then
+            dtctl auth login
+            # Valida com query real
+            dtctl_retest="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1' -o json 2>&1)" || dtctl_retest=""
+            if echo "$dtctl_retest" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+              print_warn "Login dtctl falhou. Análise DQL pode falhar."
+            else
+              print_ok "Token dtctl renovado"
+            fi
+          else
+            print_err "Token dtctl expirado. Análise DQL VAI falhar."
+            echo "  Execute: dtctl auth login"
+            echo ""
+            read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_DTCTL_ANYWAY
+            if [[ ! "$OPEN_DTCTL_ANYWAY" =~ ^[sS]$ ]]; then
+              echo "  Abortando. Faça dtctl auth login e execute novamente."
+              exit 1
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    # Abre workspace em janela nova, limpo
+    echo "🚀 Abrindo workspace de incidentes no VS Code..."
+    "$VSCODE_CMD" --new-window "$INCIDENTS_BASE" "${CREATED_FILES[0]}"
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo -e "\033[1;32m"
+  echo "  ╔══════════════════════════════════════════════════════════╗"
+  echo "  ║  No Copilot Chat (Ctrl+Shift+I), digite:                ║"
+  echo "  ║                                                          ║"
+  echo "  ║     @analisar-incidente                                  ║"
+  echo "  ║                                                          ║"
+  echo "  ║  e pressione Enter.                                      ║"
+  echo "  ╚══════════════════════════════════════════════════════════╝"
+  echo -e "\033[0m"
+  echo -e "  \033[1;33m⚠  NÃO digite texto livre (ex: \"analise o incidente\").\033[0m"
+  echo -e "  \033[1;33m     Texto livre NÃO ativa o agente MCP.\033[0m"
+  echo ""
+  echo -e "  \033[1;35m💡 Se a rotina tentar executar comandos no terminal em vez do MCP,\033[0m"
+  echo -e "  \033[1;35m     digite no chat: \"Investigue usando o mcp do workspace\"\033[0m"
+  echo ""
+  echo -e "  \033[1;36m🔌 PRIMEIRA VEZ? Verifique o MCP:\033[0m"
+  echo -e "  \033[1;36m     Ctrl+Shift+P → 'MCP: List Servers' → 'sre-readonly' Running\033[0m"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "📂 Histórico: $INCIDENTS_BASE"
+fi

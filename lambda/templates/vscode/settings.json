@@ -1,0 +1,8 @@
+{
+    "chat.promptFiles": true,
+    "chat.mcp.discovery.enabled": true,
+    "github.copilot.chat.codeGeneration.instructions": [
+        { "file": ".github/copilot-instructions.md" }
+    ],
+    "github.copilot.chat.agent.defaultModel": "claude-sonnet-4"
+}

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# investigar-lambda — Prepara workspace para investigação de Lambda AWS via Copilot
+#
+# Uso:
+#   investigar-lambda <nome-parcial-da-lambda> [--window=24h] [--from="DD-MM-YYYY HH:MM"] [--to="DD-MM-YYYY HH:MM"]
+#
+# Exemplo:
+#   investigar-lambda credit-engine-loan-caller
+#   investigar-lambda loan-service --window=48h
+#   investigar-lambda cdc-btg --from="20-05-2026 10:00" --to="20-05-2026 14:00"
+#
+# Saída: ~/Documents/investigacao/lambda/
+set -euo pipefail
+
+# Resolver symlinks para encontrar o diretório real do script (onde templates/ está)
+_resolve_script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local dir
+    dir="$(cd "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    # Se readlink retornou path relativo, resolver em relação ao dir do symlink
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd "$(dirname "$source")" && pwd
+}
+_SCRIPT_DIR="$(_resolve_script_dir)"
+
+# ─── Cores ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+WINDOW="24h"
+TIME_FROM=""
+TIME_TO=""
+LAMBDA_NAME=""
+
+# ─── Parse argumentos ─────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --window=*) WINDOW="${1#*=}"; shift ;;
+    --window)   WINDOW="${2:-24h}"; shift 2 ;;
+    --from=*)   TIME_FROM="${1#*=}"; shift ;;
+    --from)     TIME_FROM="${2:-}"; shift 2 ;;
+    --to=*)     TIME_TO="${1#*=}"; shift ;;
+    --to)       TIME_TO="${2:-}"; shift 2 ;;
+    --help|-h)
+      echo "Uso: investigar-lambda <nome-lambda> [--window=24h] [--from=\"DD-MM-YYYY HH:MM\"] [--to=\"DD-MM-YYYY HH:MM\"]"
+      echo ""
+      echo "Opções:"
+      echo "  --window=<tempo>   Janela relativa (ex: 6h, 24h, 48h, 7d). Padrão: 24h"
+      echo "  --from=<data>      Início do período (formato: DD-MM-YYYY HH:MM)"
+      echo "  --to=<data>        Fim do período (formato: DD-MM-YYYY HH:MM)"
+      echo ""
+      echo "Se --from/--to forem passados, --window é ignorado."
+      exit 0
+      ;;
+    -*)
+      echo -e "${RED}Opção desconhecida: $1${NC}"
+      exit 1
+      ;;
+    *)
+      LAMBDA_NAME="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$LAMBDA_NAME" ]]; then
+  echo -e "${RED}Uso: investigar-lambda <nome-parcial-da-lambda> [--window=24h]${NC}"
+  echo ""
+  echo "Exemplos:"
+  echo "  investigar-lambda credit-engine-loan-caller"
+  echo "  investigar-lambda loan-service --window=48h"
+  echo "  investigar-lambda cdc-btg --from=\"20-05-2026 10:00\" --to=\"20-05-2026 14:00\""
+  exit 1
+fi
+
+# ─── Validar AWS CLI ─────────────────────────────────────────────────────────
+if ! command -v aws &>/dev/null; then
+  echo -e "${RED}ERRO: aws CLI não encontrado no PATH.${NC}"
+  echo "  Instale: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html"
+  exit 1
+fi
+
+# ─── Validar --from/--to ──────────────────────────────────────────────────────
+if [[ -n "$TIME_FROM" && -z "$TIME_TO" ]] || [[ -z "$TIME_FROM" && -n "$TIME_TO" ]]; then
+  echo -e "${RED}ERRO: --from e --to devem ser usados juntos.${NC}"
+  exit 1
+fi
+
+# Validar formato da janela relativa
+if [[ -z "$TIME_FROM" ]]; then
+  if [[ ! "$WINDOW" =~ ^[0-9]+[smhd]$ ]]; then
+    echo -e "${RED}ERRO: formato inválido para --window: '${WINDOW}'${NC}"
+    echo "  Use: <numero><unidade> onde unidade = m, h, d"
+    echo "  Exemplos: 6h, 24h, 48h, 7d"
+    exit 1
+  fi
+fi
+
+# Converter datas para ISO se passadas
+resolve_time_range() {
+  if [[ -n "$TIME_FROM" ]]; then
+    # Converter DD-MM-YYYY HH:MM para ISO
+    local from_iso to_iso
+    from_iso=$(date -d "$(echo "$TIME_FROM" | awk -F'[- :]' '{printf "%s-%s-%s %s:%s", $3, $2, $1, $4, $5}')" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || {
+      echo -e "${RED}ERRO: formato inválido --from: '${TIME_FROM}' (use DD-MM-YYYY HH:MM)${NC}"
+      exit 1
+    }
+    to_iso=$(date -d "$(echo "$TIME_TO" | awk -F'[- :]' '{printf "%s-%s-%s %s:%s", $3, $2, $1, $4, $5}')" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || {
+      echo -e "${RED}ERRO: formato inválido --to: '${TIME_TO}' (use DD-MM-YYYY HH:MM)${NC}"
+      exit 1
+    }
+    echo "from=${from_iso}"
+    echo "to=${to_iso}"
+  else
+    # Janela relativa: calcular from/to baseado em --window
+    local seconds=0
+    local num="${WINDOW%[smhd]}"
+    local unit="${WINDOW: -1}"
+    case "$unit" in
+      s) seconds=$num ;;
+      m) seconds=$((num * 60)) ;;
+      h) seconds=$((num * 3600)) ;;
+      d) seconds=$((num * 86400)) ;;
+    esac
+    local to_iso from_iso
+    to_iso=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    from_iso=$(date -u -d "-${seconds} seconds" '+%Y-%m-%dT%H:%M:%SZ')
+    echo "from=${from_iso}"
+    echo "to=${to_iso}"
+  fi
+}
+
+# ─── Setup workspace ─────────────────────────────────────────────────────────
+setup_workspace() {
+  local workspace_root="$1"
+  local templates_dir="${_SCRIPT_DIR}/templates"
+
+  # Copiar configs apenas se não existirem ou se o agent mudou
+  local needs_update=false
+  if [[ ! -f "${workspace_root}/.mcp/sre-readonly.sh" ]]; then
+    needs_update=true
+  elif [[ "${_SCRIPT_DIR}/mcp/sre-readonly.sh" -nt "${workspace_root}/.mcp/sre-readonly.sh" ]]; then
+    needs_update=true
+  elif [[ "${templates_dir}/github/agents/investigar-lambda.agent.md" -nt "${workspace_root}/.github/agents/investigar-lambda.agent.md" ]]; then
+    needs_update=true
+  fi
+
+  if [[ "$needs_update" == true ]]; then
+    mkdir -p "${workspace_root}/.github/agents"
+    mkdir -p "${workspace_root}/.github/prompts"
+    mkdir -p "${workspace_root}/.vscode"
+    mkdir -p "${workspace_root}/.mcp"
+
+    cp "${templates_dir}/github/copilot-instructions.md" "${workspace_root}/.github/copilot-instructions.md"
+    cp "${templates_dir}/github/agents/investigar-lambda.agent.md" "${workspace_root}/.github/agents/"
+    cp "${templates_dir}/github/prompts/investigar-lambda.prompt.md" "${workspace_root}/.github/prompts/"
+    cp "${templates_dir}/vscode/mcp.json" "${workspace_root}/.vscode/mcp.json"
+    cp "${templates_dir}/vscode/settings.json" "${workspace_root}/.vscode/settings.json"
+    cp "${_SCRIPT_DIR}/mcp/sre-readonly.sh" "${workspace_root}/.mcp/sre-readonly.sh"
+    chmod +x "${workspace_root}/.mcp/sre-readonly.sh"
+
+    echo -e "${GREEN}✓ Workspace configurado com MCP e agentes${NC}"
+  else
+    echo -e "${GREEN}✓ Workspace já configurado (up-to-date)${NC}"
+  fi
+}
+
+# ─── Abrir VS Code ───────────────────────────────────────────────────────────
+open_vscode() {
+  local workspace_root="$1"
+
+  if command -v code &>/dev/null; then
+    echo -e "${BLUE}Abrindo VS Code...${NC}"
+    code --new-window "$workspace_root"
+    echo ""
+  else
+    echo -e "${YELLOW}⚠ VS Code ('code') não encontrado no PATH.${NC}"
+    echo -e "  Abra manualmente: ${CYAN}code --new-window ${workspace_root}${NC}"
+    echo ""
+  fi
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  local workspace_root="${HOME}/Documents/investigacao/lambda"
+  mkdir -p "$workspace_root"
+
+  # Resolver intervalo de tempo
+  local time_range
+  time_range=$(resolve_time_range)
+  local time_from time_to
+  time_from=$(echo "$time_range" | grep '^from=' | cut -d= -f2)
+  time_to=$(echo "$time_range" | grep '^to=' | cut -d= -f2)
+
+  echo ""
+  echo -e "${BOLD}╭─────────────────────────────────────────────────╮${NC}"
+  echo -e "${BOLD}│  🔍 Investigar Lambda AWS                       │${NC}"
+  echo -e "${BOLD}╰─────────────────────────────────────────────────╯${NC}"
+  echo ""
+  echo -e "  Lambda:  ${CYAN}${LAMBDA_NAME}${NC}"
+  if [[ -n "$TIME_FROM" ]]; then
+    echo -e "  Período: ${CYAN}${TIME_FROM} → ${TIME_TO}${NC}"
+  else
+    echo -e "  Janela:  ${CYAN}${WINDOW}${NC} (últimas ${WINDOW})"
+  fi
+  echo ""
+
+  # Setup workspace
+  setup_workspace "$workspace_root"
+
+  # Criar arquivo de contexto para o agente
+  cat > "${workspace_root}/.investigation-context" << EOF
+# Contexto da investigação (gerado automaticamente)
+lambda_name=${LAMBDA_NAME}
+time_from=${time_from}
+time_to=${time_to}
+window=${WINDOW}
+generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+EOF
+
+  echo -e "${GREEN}✓ Contexto salvo: .investigation-context${NC}"
+
+  # Abrir VS Code
+  open_vscode "$workspace_root"
+
+  # Mensagem amigável
+  echo -e "${GREEN}╭─────────────────────────────────────────────────╮${NC}"
+  echo -e "${GREEN}│  ✓ Workspace pronto!                            │${NC}"
+  echo -e "${GREEN}╰─────────────────────────────────────────────────╯${NC}"
+  echo ""
+  echo -e "  No chat do VS Code Copilot, digite:"
+  echo ""
+  echo -e "    ${YELLOW}@investigar-lambda ${LAMBDA_NAME}${NC}"
+  echo ""
+  echo -e "  O agente vai varrer as contas AWS, encontrar a Lambda,"
+  echo -e "  analisar alarmes, logs, métricas, deploys e gerar o"
+  echo -e "  relatório em markdown + PDF automaticamente."
+  echo ""
+  echo -e "  ${BLUE}Resultado em:${NC} ${workspace_root}/${LAMBDA_NAME}/"
+  echo ""
+}
+
+main

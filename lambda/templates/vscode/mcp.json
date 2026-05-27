@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "sre-readonly": {
+      "type": "stdio",
+      "command": "bash",
+      "args": ["${workspaceFolder}/.mcp/sre-readonly.sh"],
+      "env": {}
+    }
+  }
+}
