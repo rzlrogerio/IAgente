@@ -1143,12 +1143,53 @@ trap 'stop_spinner; rm -f "$COPILOT_TMPOUT"' EXIT
 
 # Timeout máximo para a consulta — lido de config.ini
 MAX_QUERY_TIMEOUT="$CFG_QUERY_TIMEOUT"
+EFFECTIVE_WINDOW="$CFG_WINDOW"
+
+_window_to_seconds() {
+  local raw="${1,,}"
+  local n u
+
+  raw="${raw// /}"
+  if [[ "$raw" =~ ^([0-9]+)([smhdw])$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    u="${BASH_REMATCH[2]}"
+    case "$u" in
+      s) echo "$n" ;;
+      m) echo $((n * 60)) ;;
+      h) echo $((n * 3600)) ;;
+      d) echo $((n * 86400)) ;;
+      w) echo $((n * 604800)) ;;
+      *) echo 0 ;;
+    esac
+  else
+    echo 0
+  fi
+}
 
 # Detecta se o usuário passou --window ou --from explicitamente
 _has_custom_window=false
-for _a in "$@"; do
-  [[ "$_a" == --window* || "$_a" == --from* ]] && _has_custom_window=true
+for (( _i=1; _i<=$#; _i++ )); do
+  _a="${!_i}"
+  if [[ "$_a" == --window=* ]]; then
+    _has_custom_window=true
+    EFFECTIVE_WINDOW="${_a#--window=}"
+  elif [[ "$_a" == --window ]]; then
+    _has_custom_window=true
+    _next=$((_i + 1))
+    [[ $_next -le $# ]] && EFFECTIVE_WINDOW="${!_next}"
+  elif [[ "$_a" == --from=* || "$_a" == --from ]]; then
+    _has_custom_window=true
+  fi
 done
+
+_window_seconds="$(_window_to_seconds "$EFFECTIVE_WINDOW")"
+if [[ "$_window_seconds" =~ ^[0-9]+$ ]]; then
+  if (( _window_seconds >= 86400 )) && (( MAX_QUERY_TIMEOUT < 600 )); then
+    MAX_QUERY_TIMEOUT=600
+  elif (( _window_seconds >= 21600 )) && (( MAX_QUERY_TIMEOUT < 300 )); then
+    MAX_QUERY_TIMEOUT=300
+  fi
+fi
 
 # Informa a janela de pesquisa
 if [[ "$_has_custom_window" == true ]]; then
