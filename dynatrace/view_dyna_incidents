@@ -1199,13 +1199,57 @@ else
   start_spinner "Consultando Dynatrace (últimos ${CFG_WINDOW})..."
 fi
 
+# Reconstrói argumentos para unir --from/--to com seus valores (que podem ter espaços)
+_rebuild_python_args() {
+  local -a rebuilt=()
+  local i=1
+  while (( i <= $# )); do
+    local arg="${!i}"
+    case "$arg" in
+      --from|--to)
+        local value_parts=()
+        local next=$((i+1))
+        while (( next <= $# )); do
+          local next_arg="${!next}"
+          if [[ "$next_arg" == -* ]]; then
+            break
+          fi
+          value_parts+=("$next_arg")
+          ((next++))
+        done
+        if (( ${#value_parts[@]} > 0 )); then
+          local combined="${value_parts[0]}"
+          for (( j=1; j<${#value_parts[@]}; j++ )); do
+            combined="$combined ${value_parts[$j]}"
+          done
+          rebuilt+=("${arg}=${combined}")
+          i=$next
+        else
+          rebuilt+=("$arg")
+          ((i++))
+        fi
+        ;;
+      *)
+        rebuilt+=("$arg")
+        ((i++))
+        ;;
+    esac
+  done
+  printf '%s\n' "${rebuilt[@]}"
+}
+
+# Com set -e ativo, timeout(124) encerraria o script antes deste tratamento.
+set +e
 if [[ "$1" == --* ]]; then
-  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "$@" > "$COPILOT_TMPOUT" 2>&1
+  mapfile -t REBUILT_ARGS < <(_rebuild_python_args "$@")
+  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "${REBUILT_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
   PYTHON_EXIT=$?
 else
-  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${@:2}" > "$COPILOT_TMPOUT" 2>&1
+  mapfile -t REST_ARGS < <(_rebuild_python_args "${@:2}")
+  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${REST_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
   PYTHON_EXIT=$?
 fi
+set -e
 
 # Se timeout (exit 124), avisa o usuário
 if [[ $PYTHON_EXIT -eq 124 ]]; then
