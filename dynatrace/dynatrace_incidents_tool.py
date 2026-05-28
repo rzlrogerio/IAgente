@@ -278,6 +278,14 @@ def _normalize_datetime_text(value: str) -> str:
 
     # Aceita formatos como "01-01-2026 10h15m", "01-01-2026 11h00" e "01/01/2026 11:00"
     v = v.replace("/", "-")
+
+    # Se termina com "Xh" sem minutos (ex: "13h"), adiciona ":00"
+    v = re.sub(r"(\d{1,2})h$", r"\1:00", v)
+
+    # Normalizar "XhYm" ou "Xh Y" para "X:Y"
+    v = re.sub(r"(\d{1,2})h\s*(\d{1,2})m?", r"\1:\2", v)
+
+    # Converte os h restantes para : e remove m remanescente
     v = v.replace("h", ":")
     v = v.replace("m", "")
     return v
