@@ -64,6 +64,58 @@ print_header() { echo -e "\n\033[1;36m▸ $1\033[0m"; }
 print_ok()     { echo -e "  \033[0;32m✔ $1\033[0m"; }
 print_warn()   { echo -e "  \033[0;33m⚠ $1\033[0m"; }
 print_err()    { echo -e "  \033[0;31m✘ $1\033[0m" >&2; }
+_to_lower()    { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+_to_upper()    { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+# timeout portavel (Linux/macOS): retorna 124 quando excede o tempo
+_run_with_timeout() {
+  local timeout_s="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout_s" "$@"
+    return $?
+  fi
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$timeout_s" "$@"
+    return $?
+  fi
+
+  local marker
+  marker="$(mktemp)"
+
+  "$@" &
+  local cmd_pid=$!
+
+  (
+    sleep "$timeout_s"
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      echo 1 > "$marker"
+      kill -TERM "$cmd_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$cmd_pid" 2>/dev/null || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  wait "$cmd_pid"
+  local cmd_rc=$?
+
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  if [[ -s "$marker" ]]; then
+    rm -f "$marker"
+    return 124
+  fi
+
+  rm -f "$marker"
+  return "$cmd_rc"
+}
+
+# sed -i portável: macOS BSD sed exige extensão explícita (-i ''), GNU sed aceita sem
+_sed_inplace() { if [[ "$(uname -s)" == "Darwin" ]]; then sed -i '' "$@"; else sed -i "$@"; fi; }
 
 # Spinner — roda em background enquanto o Python processa
 SPINNER_PID=""
@@ -93,7 +145,7 @@ stop_spinner() {
   fi
 }
 
-# Verifica dependências para geração de PDF (pandoc + xelatex + fvextra + fonte DejaVu)
+# Verifica dependências para geração de PDF (pandoc + xelatex + fvextra)
 PDF_AVAILABLE=false
 _check_pdf_deps() {
   local missing=()
@@ -113,17 +165,29 @@ _check_pdf_deps() {
     fi
   fi
 
-  # Verifica fonte DejaVu Sans Mono
-  if command -v fc-list >/dev/null 2>&1; then
-    if ! fc-list "DejaVu Sans Mono" 2>/dev/null | grep -q "DejaVu"; then
-      missing+=("fonts-dejavu")
+  local os_type
+  os_type="$(uname -s)"
+
+  # Validação de fontes:
+  # - macOS: evita falso negativo de DejaVu e usa fallback nativo se necessário
+  # - Linux: mantém exigência de fonts-dejavu quando o monofont configurado é DejaVu
+  if [[ "$os_type" == "Darwin" ]]; then
+    if [[ "$CFG_PDF_FONT_MAIN" == "DejaVu Sans" ]]; then
+      CFG_PDF_FONT_MAIN="Helvetica"
+    fi
+    if [[ "$CFG_PDF_FONT_MONO" == "DejaVu Sans Mono" ]]; then
+      CFG_PDF_FONT_MONO="Menlo"
+    fi
+  else
+    if [[ "$CFG_PDF_FONT_MONO" == "DejaVu Sans Mono" ]] && command -v fc-list >/dev/null 2>&1; then
+      if ! fc-list "DejaVu Sans Mono" 2>/dev/null | grep -q "DejaVu"; then
+        missing+=("fonts-dejavu")
+      fi
     fi
   fi
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     print_warn "PDF desabilitado — faltam: ${missing[*]}"
-    local os_type
-    os_type="$(uname -s)"
     if [[ "$os_type" == "Darwin" ]]; then
       echo "    Instale com: brew install pandoc && brew install --cask mactex-no-gui"
     else
@@ -211,8 +275,9 @@ _detect_dynatrace_envs() {
 }
 
 _load_dynatrace_env() {
-  # Dado um label (por exemplo: TENANT_A, TENANT_B), exporta as variáveis genéricas a partir das sufixadas.
-  local label="${1^^}"  # uppercase
+  # Dado um label genérico (ex.: TENANT_A, TENANT_B), exporta as variáveis a partir das sufixadas.
+  local label
+  label="$(_to_upper "$1")"  # uppercase
 
   local url_var="DYNATRACE_ENV_URL_${label}"
   local platform_var="DYNATRACE_PLATFORM_TOKEN_${label}"
@@ -255,7 +320,7 @@ _select_dynatrace_env() {
   if [[ ${#DETECTED_ENVS[@]} -eq 1 ]]; then
     local label="${DETECTED_ENVS[0]}"
     _load_dynatrace_env "$label"
-    print_ok "Ambiente Dynatrace: ${label,,} (unico detectado)"
+    print_ok "Ambiente Dynatrace: $(_to_lower "$label") (unico detectado)"
     return
   fi
 
@@ -265,7 +330,7 @@ _select_dynatrace_env() {
   if command -v fzf >/dev/null 2>&1; then
     selection=$(for label in "${DETECTED_ENVS[@]}"; do
       local url_var="DYNATRACE_ENV_URL_${label}"
-      printf "%-10s %s\n" "${label,,}" "${!url_var:-}"
+      printf "%-10s %s\n" "$(_to_lower "$label")" "${!url_var:-}"
     done | fzf --prompt="Selecione o ambiente Dynatrace: " --height=10 --reverse)
   fi
 
@@ -280,7 +345,7 @@ _select_dynatrace_env() {
     local i=1
     for label in "${DETECTED_ENVS[@]}"; do
       local url_var="DYNATRACE_ENV_URL_${label}"
-      printf "  %d) %-10s %s\n" "$i" "${label,,}" "${!url_var:-}"
+      printf "  %d) %-10s %s\n" "$i" "$(_to_lower "$label")" "${!url_var:-}"
       ((i++))
     done
     echo ""
@@ -293,7 +358,7 @@ _select_dynatrace_env() {
     fi
   else
     env_label="$(echo "$selection" | awk '{print $1}')"
-    env_label="${env_label^^}"
+    env_label="$(_to_upper "$env_label")"
   fi
 
   if [[ -z "$env_label" ]]; then
@@ -301,7 +366,7 @@ _select_dynatrace_env() {
   fi
 
   _load_dynatrace_env "$env_label"
-  print_ok "Ambiente selecionado: ${env_label,,} → ${DYNATRACE_ENV_URL:-}"
+  print_ok "Ambiente selecionado: $(_to_lower "$env_label") → ${DYNATRACE_ENV_URL:-}"
 }
 
 # ── 1. Validação de tokens ─────────────────────────────────────
@@ -413,54 +478,110 @@ check_aws_session() {
 
   print_header "Verificando sessão AWS..."
 
-  # Tenta pegar a identidade com qualquer profile disponível
+  # Caso CI/CD: credenciais via variáveis de ambiente
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+    if aws sts get-caller-identity >/dev/null 2>&1; then
+      print_ok "Sessão AWS ativa (credenciais de ambiente)"
+      return 0
+    fi
+    print_warn "Credenciais AWS de ambiente inválidas ou expiradas."
+  fi
+
+  # Lista profiles configurados
   local profiles
   profiles="$(aws configure list-profiles 2>/dev/null)"
   if [[ -z "$profiles" ]]; then
-    print_warn "Nenhum profile AWS configurado. Investigação AWS não estará disponível."
+    print_warn "Nenhum profile AWS configurado."
+    echo ""
+    echo "  Configure com: aws configure sso"
+    echo ""
     return 0
   fi
 
   # Testa se algum profile tem sessão ativa
-  local test_profile session_ok=false
-  for test_profile in $profiles; do
-    if aws sts get-caller-identity --profile "$test_profile" >/dev/null 2>&1; then
+  local active_profile="" session_ok=false
+  for p in $profiles; do
+    if aws sts get-caller-identity --profile "$p" >/dev/null 2>&1; then
       session_ok=true
-      print_ok "Sessão AWS ativa (profile: $test_profile)"
+      active_profile="$p"
       break
     fi
   done
 
-  if [[ "$session_ok" == false ]]; then
-    print_err "Nenhuma sessão AWS ativa. O agente não conseguirá consultar logs/métricas."
+  if [[ "$session_ok" == true ]]; then
+    print_ok "Sessão AWS ativa (profile: $active_profile)"
+    export AWS_PROFILE="$active_profile"
+    return 0
+  fi
+
+  # Nenhuma sessão ativa — detecta profiles SSO para mostrar o comando correto
+  local sso_profiles=()
+  for p in $profiles; do
+    local sso_url
+    sso_url="$(aws configure get sso_start_url --profile "$p" 2>/dev/null || true)"
+    [[ -n "$sso_url" ]] && sso_profiles+=("$p")
+  done
+  local login_profile="${sso_profiles[0]:-$(echo "$profiles" | head -1)}"
+
+  print_err "Nenhuma sessão AWS ativa."
+  echo ""
+  if [[ ${#sso_profiles[@]} -gt 0 ]]; then
+    echo "  Profiles SSO detectados: ${sso_profiles[*]}"
     echo ""
-    echo "  Faça login SSO em qualquer profile (a role é compartilhada):"
+    echo "  Para autenticar:"
+    echo -e "  \033[1;33maws sso login --profile $login_profile\033[0m"
     echo ""
-    local first_profile
-    first_profile="$(echo "$profiles" | head -1)"
-    echo -e "  \033[1;33maws sso login --profile $first_profile\033[0m"
-    echo ""
-    echo "  Após login, todos os profiles da mesma org estarão acessíveis."
-    echo ""
-    if [[ -t 0 ]]; then
-      read -r -p "  Deseja fazer login agora? (s/n): " LOGIN_ANSWER
-      if [[ "$LOGIN_ANSWER" =~ ^[sS]$ ]]; then
-        aws sso login --profile "$first_profile"
-        # Re-valida após login
-        if aws sts get-caller-identity --profile "$first_profile" >/dev/null 2>&1; then
-          print_ok "Login SSO realizado com sucesso"
+    echo "  Após o login, todos os profiles da mesma org ficam acessíveis."
+  else
+    echo "  Nenhum profile SSO detectado. Verifique suas credenciais:"
+    echo "    aws configure sso"
+  fi
+  echo ""
+
+  if [[ ! -t 0 ]]; then
+    print_warn "Continuando sem sessão AWS (stdin não interativo)."
+    return 0
+  fi
+
+  # Loop até resposta válida
+  while true; do
+    read -r -p "  Deseja fazer o login SSO agora? (s/n): " LOGIN_ANSWER
+    case "$(_to_lower "$LOGIN_ANSWER")" in
+      s|sim|y|yes)
+        print_header "Abrindo login SSO — aguarde o browser..."
+        aws sso login --profile "$login_profile"
+        if aws sts get-caller-identity --profile "$login_profile" >/dev/null 2>&1; then
+          print_ok "Login SSO realizado com sucesso (profile: $login_profile)"
+          export AWS_PROFILE="$login_profile"
+          return 0
         else
-          print_err "Login falhou. Tente manualmente: aws sso login --profile $first_profile"
+          print_err "Login falhou. Tente manualmente:"
+          echo "    aws sso login --profile $login_profile"
           return 1
         fi
-      else
-        print_warn "Continuando sem sessão AWS. Investigação de logs/métricas pode falhar."
-      fi
-    else
-      print_warn "Continuando sem sessão AWS (stdin não interativo)."
-    fi
-  fi
-  return 0
+        ;;
+      n|nao|não|no)
+        echo ""
+        print_warn "Sem sessão AWS — o agente NÃO conseguirá:"
+        echo "    • Consultar CloudWatch Logs"
+        echo "    • Buscar métricas no CloudWatch"
+        echo "    • Descrever recursos (ECS, Lambda, EC2...)"
+        echo ""
+        if [[ "${SELECTED_CLOUD:-todas}" == "aws" ]]; then
+          read -r -p "  A cloud selecionada é AWS. Deseja abortar e fazer login? (s/n): " ABORT_ANSWER
+          if [[ "$(_to_lower "$ABORT_ANSWER")" =~ ^(s|sim|y|yes)$ ]]; then
+            print_err "Abortando. Execute novamente após: aws sso login --profile $login_profile"
+            exit 1
+          fi
+        fi
+        print_warn "Continuando sem sessão AWS. Resultados estarão incompletos."
+        return 0
+        ;;
+      *)
+        echo "  Resposta inválida. Digite 's' para sim ou 'n' para não."
+        ;;
+    esac
+  done
 }
 
 # ── 1c. Pre-fetch: subscription do incidente via Dynatrace API ─
@@ -480,14 +601,15 @@ _prefetch_incident_subscription() {
   [[ -z "$prob_resp" ]] && return 0
 
   # Filtra pelo query no JSON (case-insensitive)
-  local query_lower="${query,,}"
+  local query_lower
+  query_lower="$(_to_lower "$query")"
   if ! echo "$prob_resp" | grep -qi "$query_lower"; then
     return 0
   fi
 
   # Extrai entity IDs (formato SERVICE-xxx, HOST-xxx etc) de qualquer posição no JSON
   local entity_ids
-  entity_ids="$(echo "$prob_resp" | grep -oP '\b[A-Z_]+-[A-F0-9]{16}\b' | sort -u | head -5)"
+  entity_ids="$(echo "$prob_resp" | grep -oE '[A-Z][A-Z_]*-[A-F0-9]{16}' | sort -u | head -5)"
   [[ -z "$entity_ids" ]] && return 0
 
   # Para cada entity, busca properties e tenta extrair subscription
@@ -500,14 +622,14 @@ _prefetch_incident_subscription() {
 
     # Tenta azureSubscriptionUuid
     local sub_uuid
-    sub_uuid="$(echo "$entity_resp" | grep -oP '"azureSubscriptionUuid"\s*:\s*"\K[0-9a-f-]{36}' | head -1)"
+    sub_uuid="$(echo "$entity_resp" | grep -oE '"azureSubscriptionUuid"[[:space:]]*:[[:space:]]*"[0-9a-f-]{36}' | grep -oE '[0-9a-f-]{36}$' | head -1)"
     if [[ -n "$sub_uuid" ]]; then
       echo "$sub_uuid"
       return 0
     fi
 
     # Tenta extrair de publicCloudId (/subscriptions/<uuid>/...)
-    sub_uuid="$(echo "$entity_resp" | grep -oP '/subscriptions/\K[0-9a-f-]{36}' | head -1)"
+    sub_uuid="$(echo "$entity_resp" | grep -oE '/subscriptions/[0-9a-f-]{36}' | sed 's|.*/subscriptions/||' | head -1)"
     if [[ -n "$sub_uuid" ]]; then
       echo "$sub_uuid"
       return 0
@@ -526,49 +648,81 @@ check_azure_session() {
 
   print_header "Verificando sessão Azure..."
 
-  # Verifica se há sessão ativa E se o token é válido (get-access-token força renovação real)
-  local az_account
+  # Verifica conta + valida token real (get-access-token força renovação)
+  local az_account az_token_ok=false
   az_account="$(az account show --output json 2>/dev/null)" || az_account=""
 
-  # Mesmo com account show OK, valida que o token realmente funciona
   if [[ -n "$az_account" ]]; then
-    if ! az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
-      # Token expirado — limpa e força relogin
-      az_account=""
+    if az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+      az_token_ok=true
+    else
+      print_warn "Conta detectada mas token expirado. Tentando renovar..."
+      # get-access-token pode fazer refresh silencioso se há refresh_token
+      az_account="$(az account show --output json 2>/dev/null)" || az_account=""
+      if az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+        az_token_ok=true
+      else
+        az_account=""  # Força relogin
+      fi
     fi
   fi
 
   if [[ -z "$az_account" ]]; then
     print_err "Nenhuma sessão Azure ativa."
     echo ""
-    echo "  Faça login:"
+    echo "  Para autenticar:"
     echo ""
     echo -e "  \033[1;33maz login\033[0m"
     echo ""
-    if [[ -t 0 ]]; then
-      read -r -p "  Deseja fazer login agora? (s/n): " AZ_LOGIN_ANSWER
-      if [[ "$AZ_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
-        az login
-        az_account="$(az account show --output json 2>/dev/null)" || az_account=""
-        if [[ -z "$az_account" ]]; then
-          print_err "Login Azure falhou. Tente manualmente: az login"
-          return 1
-        fi
-        print_ok "Login Azure realizado com sucesso"
-      else
-        print_warn "Continuando sem sessão Azure. Investigação Azure pode falhar."
-        return 0
-      fi
-    else
+    if [[ ! -t 0 ]]; then
       print_warn "Continuando sem sessão Azure (stdin não interativo)."
       return 0
     fi
+
+    # Loop até resposta válida
+    while true; do
+      read -r -p "  Deseja fazer login agora? (s/n): " AZ_LOGIN_ANSWER
+      case "$(_to_lower "$AZ_LOGIN_ANSWER")" in
+        s|sim|y|yes)
+          print_header "Iniciando login Azure — aguarde o browser..."
+          az login
+          az_account="$(az account show --output json 2>/dev/null)" || az_account=""
+          if [[ -n "$az_account" ]] && az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+            print_ok "Login Azure realizado com sucesso"
+            break
+          else
+            print_err "Login Azure falhou. Tente manualmente: az login"
+            return 1
+          fi
+          ;;
+        n|nao|não|no)
+          echo ""
+          print_warn "Sem sessão Azure — o agente NÃO conseguirá:"
+          echo "    • Consultar Azure Monitor / Application Insights"
+          echo "    • Descrever recursos (App Services, AKS, VMs...)"
+          echo "    • Buscar logs no Log Analytics"
+          echo ""
+          if [[ "${SELECTED_CLOUD:-todas}" == "azure" ]]; then
+            read -r -p "  A cloud selecionada é Azure. Deseja abortar e fazer login? (s/n): " ABORT_ANSWER
+            if [[ "$(_to_lower "$ABORT_ANSWER")" =~ ^(s|sim|y|yes)$ ]]; then
+              print_err "Abortando. Execute novamente após: az login"
+              exit 1
+            fi
+          fi
+          print_warn "Continuando sem sessão Azure. Resultados estarão incompletos."
+          return 0
+          ;;
+        *)
+          echo "  Resposta inválida. Digite 's' para sim ou 'n' para não."
+          ;;
+      esac
+    done
   fi
 
   # Extrai informações da subscription ativa
   local sub_name sub_id
-  sub_name="$(echo "$az_account" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -1)"
-  sub_id="$(echo "$az_account" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1)"
+  sub_name="$(echo "$az_account" | sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
+  sub_id="$(echo "$az_account" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)"
   print_ok "Sessão Azure ativa (subscription: $sub_name)"
 
   # Exporta para o Python usar na enrichment
@@ -611,7 +765,7 @@ check_azure_session() {
       echo "  Subscription ativa:        $sub_name ($sub_id)"
       echo ""
       read -r -p "  Deseja trocar para a subscription do incidente? (s/n): " AZ_SUB_ANSWER
-      if [[ "$AZ_SUB_ANSWER" =~ ^[sS]$ ]]; then
+      if [[ "$(_to_lower "$AZ_SUB_ANSWER")" =~ ^(s|sim|y|yes)$ ]]; then
         az account set --subscription "$incident_sub" 2>/dev/null
         export AZURE_SUBSCRIPTION_ID="$incident_sub"
         export AZURE_SUBSCRIPTION_NAME="$incident_sub_name"
@@ -855,7 +1009,7 @@ _configure_dtctl_context() {
       fi
       # Valida com query real (doctor NÃO valida token OAuth expirado)
       local _dtctl_test
-      _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+      _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
       if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
         print_ok "dtctl: OK (query validada)"
         return 0
@@ -867,7 +1021,7 @@ _configure_dtctl_context() {
         token_ref="$(grep -A5 "name: ${existing_ctx}$" "$config_file" 2>/dev/null | grep 'token-ref:' | head -1 | awk '{print $2}' || true)"
         if [[ -n "$token_ref" ]]; then
           dtctl config set-credentials "$token_ref" --token "$token" 2>/dev/null || true
-          _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+          _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
           if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
             print_ok "dtctl: OK (token reparado)"
             return 0
@@ -882,7 +1036,7 @@ _configure_dtctl_context() {
         read -r -p "  Deseja fazer login agora? (s/n): " DTCTL_LOGIN_ANSWER
         if [[ "$DTCTL_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
           dtctl auth login
-          _dtctl_test="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+          _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
           if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
             print_ok "dtctl: OK (login realizado)"
             return 0
@@ -923,7 +1077,7 @@ _configure_dtctl_context() {
   dtctl config use-context "$context_name" 2>/dev/null || true
 
   # Valida
-  if timeout 10 dtctl doctor >/dev/null 2>&1; then
+  if _run_with_timeout 10 dtctl doctor >/dev/null 2>&1; then
     print_ok "dtctl doctor: OK"
   else
     print_warn "dtctl doctor reportou problemas — recomenda-se:"
@@ -1114,7 +1268,7 @@ for arg in "$@"; do
     _load_dynatrace_env "${arg#--env=}"
   elif [[ "$arg" == --cloud=* ]]; then
     SELECTED_CLOUD="${arg#--cloud=}"
-    SELECTED_CLOUD="${SELECTED_CLOUD,,}"  # lowercase
+    SELECTED_CLOUD="$(_to_lower "$SELECTED_CLOUD")"  # lowercase
   else
     REMAINING_ARGS+=("$arg")
   fi
@@ -1146,7 +1300,8 @@ MAX_QUERY_TIMEOUT="$CFG_QUERY_TIMEOUT"
 EFFECTIVE_WINDOW="$CFG_WINDOW"
 
 _window_to_seconds() {
-  local raw="${1,,}"
+  local raw
+  raw="$(_to_lower "${1:-}")"
   local n u
 
   raw="${raw// /}"
@@ -1241,12 +1396,22 @@ _rebuild_python_args() {
 # Com set -e ativo, timeout(124) encerraria o script antes deste tratamento.
 set +e
 if [[ "$1" == --* ]]; then
-  mapfile -t REBUILT_ARGS < <(_rebuild_python_args "$@")
-  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "${REBUILT_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
+  # Reconstrói argumentos se houver --from ou --to sem =
+  REBUILT_ARGS=()
+  while IFS= read -r _arg; do
+    REBUILT_ARGS+=("$_arg")
+  done < <(_rebuild_python_args "$@")
+  _run_with_timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" "${REBUILT_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
   PYTHON_EXIT=$?
 else
-  mapfile -t REST_ARGS < <(_rebuild_python_args "${@:2}")
-  timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${REST_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
+  # Reconstrói argumentos restantes
+  REST_ARGS=()
+  if (( $# > 1 )); then
+    while IFS= read -r _arg; do
+      REST_ARGS+=("$_arg")
+    done < <(_rebuild_python_args "${@:2}")
+  fi
+  _run_with_timeout "$MAX_QUERY_TIMEOUT" "$VENV_PYTHON" "$ROOT_DIR/dynatrace_incidents_tool.py" --query "$1" "${REST_ARGS[@]}" > "$COPILOT_TMPOUT" 2>&1
   PYTHON_EXIT=$?
 fi
 set -e
@@ -1255,7 +1420,7 @@ set -e
 if [[ $PYTHON_EXIT -eq 124 ]]; then
   stop_spinner
   echo ""
-  print_warn "Timeout (${MAX_QUERY_TIMEOUT}s) — tente reduzir a janela: --window=5m"
+  print_warn "Timeout (${MAX_QUERY_TIMEOUT}s) para janela ${EFFECTIVE_WINDOW} — reduza --window ou aumente defaults.query_timeout no config.ini"
   exit 1
 fi
 
@@ -1428,15 +1593,15 @@ SETTINGS_EOF
     else
       settings_changed=false
       if ! grep -q "chat.mcp.discovery.enabled" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
-        sed -i '$ s/}/,\n    "chat.mcp.discovery.enabled": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        _sed_inplace '$ s/}/,\n    "chat.mcp.discovery.enabled": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
         settings_changed=true
       fi
       if ! grep -q "chat.mcp.autoStart" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
-        sed -i '$ s/}/,\n    "chat.mcp.autoStart": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        _sed_inplace '$ s/}/,\n    "chat.mcp.autoStart": true\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
         settings_changed=true
       fi
       if ! grep -q "github.copilot.chat.agent.disabledTools" "$INCIDENTS_BASE/.vscode/settings.json" 2>/dev/null; then
-        sed -i '$ s/}/,\n    "github.copilot.chat.agent.disabledTools": [\n        "run_in_terminal"\n    ]\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
+        _sed_inplace '$ s/}/,\n    "github.copilot.chat.agent.disabledTools": [\n        "run_in_terminal"\n    ]\n}/' "$INCIDENTS_BASE/.vscode/settings.json"
         settings_changed=true
       fi
       if [[ "$settings_changed" == true ]]; then
@@ -1454,33 +1619,43 @@ SETTINGS_EOF
         # Usa get-access-token para forçar renovação real (account show pode usar cache)
         if ! az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
           echo ""
-          print_warn "Sessão Azure expirou durante a coleta. Faça login antes de usar o agente."
+          print_warn "Sessão Azure expirou durante a coleta."
           echo ""
           echo -e "  \033[1;33maz login\033[0m"
           echo ""
           if [[ -t 0 ]]; then
-            read -r -p "  Deseja fazer login agora? (s/n): " AZ_RELOGIN
-            if [[ "$AZ_RELOGIN" =~ ^[sS]$ ]]; then
-              az login
-              if az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
-                print_ok "Sessão Azure renovada"
-                # Garante subscription correta
-                if [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]]; then
-                  az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
-                fi
-              else
-                print_err "Login Azure falhou. O agente pode encontrar erros de autenticação."
-              fi
-            else
-              print_err "Sessão Azure expirada. O agente VAI falhar com AUTH_EXPIRED."
-              echo "  Execute: az login"
-              echo ""
-              read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_ANYWAY
-              if [[ ! "$OPEN_ANYWAY" =~ ^[sS]$ ]]; then
-                echo "  Abortando. Faça az login e execute novamente."
-                exit 1
-              fi
-            fi
+            while true; do
+              read -r -p "  Deseja renovar o login Azure agora? (s/n): " AZ_RELOGIN
+              case "$(_to_lower "$AZ_RELOGIN")" in
+                s|sim|y|yes)
+                  az login
+                  if az account get-access-token --resource https://management.azure.com/ >/dev/null 2>&1; then
+                    print_ok "Sessão Azure renovada"
+                    # Garante subscription correta
+                    if [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]]; then
+                      az account set --subscription "$AZURE_SUBSCRIPTION_ID" 2>/dev/null || true
+                    fi
+                  else
+                    print_err "Login Azure falhou. O agente pode encontrar erros de autenticação."
+                  fi
+                  break
+                  ;;
+                n|nao|não|no)
+                  print_err "Sessão Azure expirada. O agente VAI falhar com AUTH_EXPIRED."
+                  echo "  Execute: az login"
+                  echo ""
+                  read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_ANYWAY
+                  if [[ ! "$OPEN_ANYWAY" =~ ^[sS]$ ]]; then
+                    echo "  Abortando. Faça az login e execute novamente."
+                    exit 1
+                  fi
+                  break
+                  ;;
+                *)
+                  echo "  Resposta inválida. Digite 's' para sim ou 'n' para não."
+                  ;;
+              esac
+            done
           fi
         fi
       fi
@@ -1490,34 +1665,44 @@ SETTINGS_EOF
     if command -v dtctl >/dev/null 2>&1; then
       # dtctl doctor verifica config mas NÃO valida se o token OAuth está expirado.
       # Uma query leve "fetch dt.entity.host | limit 1" é a única forma confiável.
-      dtctl_test_output="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || dtctl_test_output=""
+      dtctl_test_output="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || dtctl_test_output=""
       if echo "$dtctl_test_output" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
         echo ""
-        print_warn "Token dtctl SSO expirado. Faça login antes de usar o agente."
+        print_warn "Token dtctl SSO expirado."
         echo ""
         echo -e "  \033[1;33mdtctl auth login\033[0m"
         echo ""
         if [[ -t 0 ]]; then
-          read -r -p "  Deseja fazer login agora? (s/n): " DTCTL_RELOGIN
-          if [[ "$DTCTL_RELOGIN" =~ ^[sS]$ ]]; then
-            dtctl auth login
-            # Valida com query real
-            dtctl_retest="$(timeout 15 dtctl query 'fetch dt.entity.host | limit 1' -o json 2>&1)" || dtctl_retest=""
-            if echo "$dtctl_retest" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
-              print_warn "Login dtctl falhou. Análise DQL pode falhar."
-            else
-              print_ok "Token dtctl renovado"
-            fi
-          else
-            print_err "Token dtctl expirado. Análise DQL VAI falhar."
-            echo "  Execute: dtctl auth login"
-            echo ""
-            read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_DTCTL_ANYWAY
-            if [[ ! "$OPEN_DTCTL_ANYWAY" =~ ^[sS]$ ]]; then
-              echo "  Abortando. Faça dtctl auth login e execute novamente."
-              exit 1
-            fi
-          fi
+          while true; do
+            read -r -p "  Deseja renovar o login dtctl agora? (s/n): " DTCTL_RELOGIN
+            case "$(_to_lower "$DTCTL_RELOGIN")" in
+              s|sim|y|yes)
+                dtctl auth login
+                # Valida com query real
+                dtctl_retest="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1' -o json 2>&1)" || dtctl_retest=""
+                if echo "$dtctl_retest" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+                  print_warn "Login dtctl falhou. Análise DQL pode falhar."
+                else
+                  print_ok "Token dtctl renovado"
+                fi
+                break
+                ;;
+              n|nao|não|no)
+                print_err "Token dtctl expirado. Análise DQL VAI falhar."
+                echo "  Execute: dtctl auth login"
+                echo ""
+                read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_DTCTL_ANYWAY
+                if [[ ! "$OPEN_DTCTL_ANYWAY" =~ ^[sS]$ ]]; then
+                  echo "  Abortando. Faça dtctl auth login e execute novamente."
+                  exit 1
+                fi
+                break
+                ;;
+              *)
+                echo "  Resposta inválida. Digite 's' para sim ou 'n' para não."
+                ;;
+            esac
+          done
         fi
       fi
     fi

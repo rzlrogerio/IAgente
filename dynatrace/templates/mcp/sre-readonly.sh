@@ -266,7 +266,8 @@ execute_command() {
   }
 
   # Detecta falhas de autenticação e adiciona instrução de remediação
-  local output_lower="${output,,}"
+  local output_lower
+  output_lower="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
   if [[ $exit_code -ne 0 || "$output_lower" == *"expired"* || "$output_lower" == *"please run"* ]]; then
     # Azure CLI auth failure
     if [[ "$output_lower" == *"az login"* || "$output_lower" == *"az account set"* || "$output_lower" == *"refresh token"* || "$output_lower" == *"token has expired"* || "$output_lower" == *"AADSTS"* ]]; then
