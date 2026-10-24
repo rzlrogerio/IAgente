@@ -44,6 +44,19 @@ Uma estrutura modular e padronizada facilita a replicação:
 │   │   │       └── investigar-lambda.prompt.md
 │   │   └── mcp/
 │   │       └── sre-readonly.sh
+├── python/
+│   ├── README.md
+│   ├── install.sh
+│   ├── investigar-code
+│   └── templates/
+│       ├── github/
+│       │   ├── copilot-instructions.md
+│       │   ├── agents/
+│       │   │   └── investigar-code.agent.md
+│       │   └── prompts/
+│       │       └── investigar-code.prompt.md
+│       └── vscode/
+│           └── settings.json
 ```
 
 ---
@@ -176,6 +189,7 @@ Exemplo:
 ```md
 - `dynatrace/README.md` — Guia de uso para Dynatrace
 - `lambda/README.md` — Guia de uso para Lambda AWS
+- `python/README.md` — Guia de uso para revisao de projetos Python
 ```
 
 Cada README específico deve conter:

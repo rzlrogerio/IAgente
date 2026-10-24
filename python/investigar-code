@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_script_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local dir
+    dir="$(cd "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd "$(dirname "$source")" && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_dir)"
+TEMPLATES_DIR="$SCRIPT_DIR/templates"
+OPEN_VSCODE=true
+
+usage() {
+  cat <<'EOF'
+Uso: investigar-code [--no-open]
+
+Configura o clone Git Python do diretorio atual e abre sua raiz no VS Code.
+
+Opcoes:
+  --no-open  Apenas configura os arquivos, sem abrir o VS Code
+  -h, --help Mostra esta ajuda
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-open) OPEN_VSCODE=false ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Erro: opcao invalida: $1" >&2; usage; exit 1 ;;
+  esac
+  shift
+done
+
+PROJECT_ROOT="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$PROJECT_ROOT" ]]; then
+  echo "Erro: execute investigar-code dentro de um clone Git." >&2
+  exit 1
+fi
+
+copy_if_newer() {
+  local source="$1" target="$2"
+  if [[ ! -f "$target" || "$source" -nt "$target" ]]; then
+    mkdir -p "$(dirname "$target")"
+    cp "$source" "$target"
+    return 0
+  fi
+  return 1
+}
+
+setup_workspace() {
+  local updated=0
+  local source target
+
+  while IFS= read -r source; do
+    target="$PROJECT_ROOT/${source#"$TEMPLATES_DIR/"}"
+    if copy_if_newer "$source" "$target"; then
+      updated=$((updated + 1))
+    fi
+  done < <(find "$TEMPLATES_DIR" -type f -print)
+
+  mkdir -p "$PROJECT_ROOT/.github/agents" "$PROJECT_ROOT/.github/prompts" "$PROJECT_ROOT/.vscode"
+  printf '%s\n' \
+    '# Contexto gerado por investigar-code' \
+    "project_root=$PROJECT_ROOT" \
+    'git_root=true' \
+    "generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    > "$PROJECT_ROOT/.python-code-context"
+
+  echo "Projeto Python configurado: $PROJECT_ROOT"
+  echo "Arquivos de agente atualizados: $updated"
+}
+
+setup_workspace
+
+if [[ "$OPEN_VSCODE" == true ]]; then
+  if command -v code >/dev/null 2>&1; then
+    code --new-window "$PROJECT_ROOT"
+  else
+    echo "Aviso: VS Code ('code') nao encontrado no PATH." >&2
+    echo "Abra manualmente: code --new-window '$PROJECT_ROOT'"
+  fi
+fi
+
+echo "No Copilot Chat, use: @investigar-code"
