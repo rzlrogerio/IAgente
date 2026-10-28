@@ -1,0 +1,8 @@
+llama3.2
+qwen2.5:7b
+mistral:7b
+gemma2:9b
+qwen2.5:14b
+deepseek-r1:7b
+phi3:mini
+llama3.2:3b
