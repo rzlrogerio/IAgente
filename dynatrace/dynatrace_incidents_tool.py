@@ -3618,7 +3618,7 @@ def _dtctl_available() -> bool:
             ["dtctl", "doctor"],
             capture_output=True, text=True, timeout=15,
         )
-        return result.returncode == 0 and "[OK]" in result.stdout
+        return result.returncode == 0 and ("[OK]" in result.stdout or "ok" in result.stdout.lower())
     except (subprocess.TimeoutExpired, OSError):
         return False
 
@@ -4542,8 +4542,9 @@ def main() -> int:
                 print("  (nenhum dado adicional obtido via dtctl)")
         elif not args.no_dtctl and not shutil.which("dtctl"):
             print("\n⚠ dtctl nao instalado — analise de topologia/dependencias indisponivel.")
-            print("  Instale: curl -fsSL https://raw.githubusercontent.com/dynatrace-oss/dtctl/main/install.sh | sh")
+            print("  Instale: curl -fsSL https://raw.githubusercontent.com/Dynatrace/dtctl/main/install.sh | sh")
             print("  Configure: dtctl auth login --context my-env --environment \"https://<tenant>.apps.dynatrace.com\"")
+            print("  (Autenticacao via SSO com permissoes por role — nenhum token manual necessario)")
 
         return 0
 

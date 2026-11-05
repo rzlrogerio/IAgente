@@ -289,7 +289,7 @@ execute_command() {
     if [[ "$output_lower" == *"sso authentication"* || "$output_lower" == *"403"*"sso"* || "$output_lower" == *"token is expired"* || "$output_lower" == *"unauthorized"*"sso"* ]]; then
       echo "$output"
       echo ""
-      echo "AUTH_EXPIRED: Token Dynatrace SSO expirado. Execute no terminal: dtctl auth login"
+      echo "AUTH_EXPIRED: Sessão Dynatrace SSO expirada. Execute no terminal: dtctl auth login"
       echo "Após login, tente novamente o comando."
       return $exit_code
     fi

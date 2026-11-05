@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # MCP Server — SRE Read-Only Shell
-# Executa comandos aws, kubectl e dtctl somente em modo leitura.
+# Executa comandos aws, az e dtctl somente em modo leitura.
 # Protocolo: JSON-RPC 2.0 over stdio (MCP spec)
 # Segurança: allowlist de subcomandos, bloqueio de mutações.
 # Compatível com Linux e macOS (bash 3.2+).
-set -euo pipefail
+set -uo pipefail
+
+# Ignorar SIGPIPE — evita morte prematura se VS Code fechar conexão
+trap '' PIPE
 
 # ─── Portabilidade ───────────────────────────────────────────────────────────
 # macOS não tem `timeout` nativo — usar perl como fallback
@@ -28,8 +31,10 @@ fi
 # ─── Allowlists ──────────────────────────────────────────────────────────────
 # Subcomandos permitidos por ferramenta (read-only)
 AWS_ALLOWED="^(get-|describe-|list-|lookup-events|get-metric-statistics|get-log-events|filter-log-events|get-query-results|start-query|batch-get|get-caller-identity)"
-KUBECTL_ALLOWED="^(get|logs|describe|top|rollout|events|api-resources)$"
 DTCTL_ALLOWED="^(query|get|describe|doctor|version)$"
+AZ_ALLOWED="^(show|list|get-credentials|get-upgrades|get-versions)$"
+AZ_SERVICES_ALLOWED="^(aks|monitor|resource|network|vm|vmss|account|graph)$"
+AZ_BLOCKED_SUBCMDS="^(create|delete|update|start|stop|restart|scale|upgrade|rotate-certs|run-command)$"
 PANDOC_ALLOWED_OUTPUT="\.(pdf|html)$"
 
 # Padrões SEMPRE bloqueados (independente da ferramenta)
@@ -85,32 +90,6 @@ validate_aws() {
   return 0
 }
 
-validate_kubectl() {
-  local cmd="$1"
-  local subcmd
-  subcmd=$(echo "$cmd" | awk '{print $2}')
-  # Caso especial: "rollout history"
-  if [[ "$subcmd" == "rollout" ]]; then
-    local sub2
-    sub2=$(echo "$cmd" | awk '{print $3}')
-    if [[ "$sub2" == "history" || "$sub2" == "status" ]]; then
-      return 0
-    fi
-    echo "BLOCKED: kubectl rollout '$sub2' não permitido (apenas history/status)"
-    return 1
-  fi
-  if ! echo "$subcmd" | grep -qE "$KUBECTL_ALLOWED"; then
-    echo "BLOCKED: subcomando kubectl '$subcmd' não está na allowlist (somente leitura)"
-    return 1
-  fi
-  # Bloquear flags de mutação
-  if [[ "$cmd" =~ --delete || "$cmd" =~ --patch || "$cmd" =~ --edit || "$cmd" =~ --force ]]; then
-    echo "BLOCKED: flag de mutação detectada no kubectl"
-    return 1
-  fi
-  return 0
-}
-
 validate_dtctl() {
   local cmd="$1"
   local subcmd
@@ -119,6 +98,65 @@ validate_dtctl() {
     echo "BLOCKED: subcomando dtctl '$subcmd' não está na allowlist (somente leitura)"
     return 1
   fi
+  return 0
+}
+
+validate_az() {
+  local cmd="$1"
+  # az <service> [subgroup] <action> [args...]
+  local svc subcmd action
+  svc=$(echo "$cmd" | awk '{print $2}')
+  subcmd=$(echo "$cmd" | awk '{print $3}')
+  action=$(echo "$cmd" | awk '{print $4}')
+
+  # Caso especial: az account show / az account list
+  if [[ "$svc" == "account" ]]; then
+    if [[ "$subcmd" == "show" || "$subcmd" == "list" || "$subcmd" == "list-locations" ]]; then
+      return 0
+    fi
+    echo "BLOCKED: subcomando 'az account $subcmd' não permitido (somente show/list)"
+    return 1
+  fi
+
+  # Caso especial: az monitor (activity-log list, metrics list, log-analytics query)
+  if [[ "$svc" == "monitor" ]]; then
+    if [[ "$subcmd" == "activity-log" || "$subcmd" == "metrics" || "$subcmd" == "log-analytics" || "$subcmd" == "diagnostic-settings" ]]; then
+      if [[ "$action" == "list" || "$action" == "show" || "$action" == "query" ]]; then
+        return 0
+      fi
+      echo "BLOCKED: 'az monitor $subcmd $action' não permitido (somente list/show/query)"
+      return 1
+    fi
+    echo "BLOCKED: 'az monitor $subcmd' não permitido"
+    return 1
+  fi
+
+  # Verificar que o serviço está na lista permitida
+  if ! echo "$svc" | grep -qE "$AZ_SERVICES_ALLOWED"; then
+    echo "BLOCKED: serviço Azure '$svc' não está na allowlist (somente: aks, monitor, resource, network, vm, vmss, account, graph)"
+    return 1
+  fi
+
+  # Determinar a ação efetiva: pode ser $subcmd direto ou $action (se $subcmd for sub-grupo)
+  # Sub-grupos conhecidos: nodepool, addon, command, mesh (para aks); nsg, vnet, public-ip (para network)
+  local effective_action="$subcmd"
+  local known_subgroups="nodepool|addon|command|mesh|nsg|vnet|public-ip|rule|subnet|nic|lb"
+  if echo "$subcmd" | grep -qE "^($known_subgroups)$"; then
+    effective_action="$action"
+  fi
+
+  # Bloquear ações de escrita/mutação
+  if echo "$effective_action" | grep -qE "$AZ_BLOCKED_SUBCMDS"; then
+    echo "BLOCKED: ação Azure '$effective_action' é de escrita/mutação (não permitido)"
+    return 1
+  fi
+
+  # Ação efetiva deve ser read-only
+  if ! echo "$effective_action" | grep -qE "$AZ_ALLOWED"; then
+    echo "BLOCKED: ação Azure '$effective_action' não está na allowlist (somente: show, list, get-credentials, get-upgrades, get-versions)"
+    return 1
+  fi
+
   return 0
 }
 
@@ -164,10 +202,10 @@ validate_command() {
     return $?
   fi
 
-  # Para aws/kubectl, aplicar todas as verificações de segurança
+  # Para aws, aplicar todas as verificações de segurança
   check_blocked_patterns "$cmd" || return 1
 
-  # Para aws/kubectl, validar pipes (se houver)
+  # Para aws, validar pipes (se houver)
   local first_cmd="$cmd"
   if [[ "$cmd" == *"|"* ]]; then
     first_cmd="$first_segment"
@@ -189,14 +227,18 @@ validate_command() {
 
   case "$tool" in
     aws)     validate_aws "$first_cmd" ;;
-    kubectl) validate_kubectl "$first_cmd" ;;
+    az)      validate_az "$first_cmd" ;;
+    kubectl)
+      echo "BLOCKED: kubectl não permitido. Use dtctl para dados K8s via Dynatrace DQL."
+      return 1
+      ;;
     pandoc)  validate_pandoc "$cmd" ;;
     ls|stat|cat|file|wc|head|tail|date)
       # Ferramentas read-only básicas — permitidas sem restrição
       return 0
       ;;
     *)
-      echo "BLOCKED: ferramenta '$tool' não permitida (apenas aws, kubectl, dtctl, pandoc, ls, stat, cat, file)"
+      echo "BLOCKED: ferramenta '$tool' não permitida (apenas aws, az, dtctl, pandoc, ls, stat, cat, file)"
       return 1
       ;;
   esac
@@ -214,17 +256,47 @@ execute_command() {
   }
 
   # Executar com timeout
-  local output
+  local output exit_code=0
   output=$(_timeout "${timeout}" "$cmd") || {
-    local exit_code=$?
+    exit_code=$?
     if [[ $exit_code -eq 124 ]]; then
       echo "TIMEOUT: comando excedeu ${timeout}s"
-    else
-      echo "$output"
+      return $exit_code
     fi
-    return $exit_code
   }
+
+  # Detecta falhas de autenticação e adiciona instrução de remediação
+  local output_lower
+  output_lower="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
+  if [[ $exit_code -ne 0 || "$output_lower" == *"expired"* || "$output_lower" == *"please run"* ]]; then
+    # Azure CLI auth failure
+    if [[ "$output_lower" == *"az login"* || "$output_lower" == *"az account set"* || "$output_lower" == *"refresh token"* || "$output_lower" == *"token has expired"* || "$output_lower" == *"AADSTS"* ]]; then
+      echo "$output"
+      echo ""
+      echo "AUTH_EXPIRED: Sessão Azure expirada. Execute no terminal: az login"
+      echo "Após login, tente novamente o comando."
+      return $exit_code
+    fi
+    # AWS SSO token expired
+    if [[ "$output_lower" == *"sso session"* || "$output_lower" == *"token has expired"* || "$output_lower" == *"the sso"*"expired"* || "$output_lower" == *"unauthorized"*"sso"* || "$output_lower" == *"invalididentitytoken"* || "$output_lower" == *"expiredtoken"* ]]; then
+      echo "$output"
+      echo ""
+      echo "AUTH_EXPIRED: Sessão AWS SSO expirada. Execute no terminal: aws sso login --profile <PROFILE>"
+      echo "Após login, tente novamente o comando."
+      return $exit_code
+    fi
+    # Dynatrace SSO failure (dtctl/API)
+    if [[ "$output_lower" == *"sso authentication"* || "$output_lower" == *"403"*"sso"* || "$output_lower" == *"token is expired"* || "$output_lower" == *"unauthorized"*"sso"* ]]; then
+      echo "$output"
+      echo ""
+      echo "AUTH_EXPIRED: Sessão Dynatrace SSO expirada. Execute no terminal: dtctl auth login"
+      echo "Após login, tente novamente o comando."
+      return $exit_code
+    fi
+  fi
+
   echo "$output"
+  return $exit_code
 }
 
 # ─── MCP Protocol (JSON-RPC 2.0 over stdio) ─────────────────────────────────
@@ -232,7 +304,7 @@ execute_command() {
 TOOLS_JSON='[
   {
     "name": "sre_run_command",
-    "description": "Executa um comando read-only de SRE (aws, kubectl, dtctl). Bloqueia automaticamente qualquer operação de escrita/mutação.",
+    "description": "Executa um comando read-only de SRE (aws, az, dtctl, pandoc). kubectl NÃO permitido. Bloqueia automaticamente qualquer operação de escrita/mutação.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -319,14 +391,23 @@ handle_tools_call() {
 
 # ─── Main loop ───────────────────────────────────────────────────────────────
 main() {
-  while IFS= read -r line; do
-    # Skip empty lines
-    [[ -z "$line" ]] && continue
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip \r (Windows line endings) and skip empty/whitespace-only lines
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*$ ]] && continue
+
+    # Skip Content-Length headers (some MCP clients send HTTP-style framing)
+    [[ "$line" =~ ^Content-Length: ]] && continue
+
+    # Validate JSON before processing
+    if ! echo "$line" | jq -e . >/dev/null 2>&1; then
+      continue
+    fi
 
     local method id params
-    method=$(echo "$line" | jq -r '.method // empty')
-    id=$(echo "$line" | jq -r '.id // empty')
-    params=$(echo "$line" | jq -c '.params // {}')
+    method=$(echo "$line" | jq -r '.method // empty') || continue
+    id=$(echo "$line" | jq -r '.id // empty') || continue
+    params=$(echo "$line" | jq -c '.params // {}') || continue
 
     case "$method" in
       "initialize")

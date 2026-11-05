@@ -38,6 +38,8 @@ font_mono = DejaVu Sans Mono
 # Lista de tenants disponíveis para seleção interativa.
 # Formato: label = url
 # Os tokens são lidos de variáveis de ambiente:
-#   DYNATRACE_ENV_URL_<LABEL>, DYNATRACE_API_TOKEN_<LABEL>, DYNATRACE_PLATFORM_TOKEN_<LABEL>
+#   DYNATRACE_ENV_URL_<LABEL>, DYNATRACE_API_TOKEN_<LABEL>
+# Para consultas DQL/Grail e Davis via dtctl, basta utilizar 'dtctl auth login' (permissões via role, sem necessidade de token).
+# DYNATRACE_PLATFORM_TOKEN_<LABEL> é opcional (apenas para fallback via API REST sem dtctl).
 tenant_a = https://<tenant-a>.live.dynatrace.com
 tenant_b = https://<tenant-b>.live.dynatrace.com
