@@ -1,251 +1,143 @@
-# Davis Root Cause Analysis Integration
+# Integração Davis Root Cause Analysis (via dtctl & DQL)
 
-**Status**: ✅ Implementado (requer token DQL/Grail)
-
-## ⚡ Quick Start (5 minutos)
-
-1. **Acesse**: https://myaccount.dynatrace.com/profile
-2. **Vá para**: Security → Tokens
-3. **Clique**: "Create token"
-4. **Configure**: Nome `davis-incidents-analysis`, scopes `storage:events:read` + `storage:entities:read`
-5. **Copie o token** (aparece apenas uma vez, começa com `sdt0c60...`)
-6. **Configure**:
-   ```bash
-   export DYNATRACE_PLATFORM_TOKEN="sdt0c60.SV3U5WQXAMPLE..."
-   ```
-7. **Teste**:
-   ```bash
-   view_dyna_incidents credit --window=3h --davis
-   ```
+**Status**: ✅ Ativo por padrão (autenticação SSO via `dtctl auth login`)
 
 ---
 
-## O que é Davis?
+## ⚡ Quick Start (Autenticação Zero Token)
 
-Davis é o mecanismo de IA do Dynatrace que fornece:
-- **Event Causation**: Cadeia de causa de eventos correlacionados
-- **Root Cause Analysis**: Identificação automática da entidade primária que causou a falha
-- **Impact Analysis**: Propagação de falhas em serviços dependentes
-- **Correlation**: Agrupamento de eventos relacionados por contexto
+Com o suporte a `dtctl auth login`, **não é mais necessário gerar nem gerenciar tokens estáticos** (`DYNATRACE_PLATFORM_TOKEN` / `sdt0c60...`). O acesso é concedido diretamente com base nas **roles e permissões (RBAC)** atribuídas ao seu usuário no Dynatrace.
 
-## Como Configurar
-
-### 1. Criar Token DQL/Grail
-
-Acesse https://myaccount.dynatrace.com/profile:
-
-1. Clique em **Profile** (se necessário)
-2. Vá para **Security** (opções de segurança)
-3. Localize a seção de **Tokens** ou **API Tokens**
-4. Clique em **Create token** (ou similar)
-5. Configure:
-   - **Name**: `davis-incidents-analysis`
-   - **Scopes necessários**:
-     - `storage:events:read`
-     - `storage:entities:read`
-     - Opcional: `events.read, entities.read` (para Classic API)
-6. Gere e **copie o token** imediatamente (não será exibido novamente)
-
-### 2. Configurar Variável de Ambiente
-
-**Opção A: Via linha de comando**
+### Passo 1: Instale o `dtctl`
 
 ```bash
-# Copie o token gerado em myaccount.dynatrace.com/profile
-export DYNATRACE_PLATFORM_TOKEN="sdt0c60.SV3U5WQXAMPLE..."
-export DYNATRACE_ENV_URL="https://seu-tenant.live.dynatrace.com"
+# Script oficial (Linux / macOS)
+curl -fsSL https://raw.githubusercontent.com/Dynatrace/dtctl/main/install.sh | sh
+
+# Ou via Homebrew (macOS / Linux)
+brew install dynatrace-oss/tap/dtctl
 ```
 
-**Opção B: Via arquivo `.env` (recomendado)**
+Repositório oficial: [https://github.com/Dynatrace/dtctl](https://github.com/Dynatrace/dtctl)
 
-No diretório do projeto:
+### Passo 2: Faça Login via SSO no Dynatrace
 
 ```bash
-cd /path/to/your/project/dynatrace/
-cp .env.example .env
-nano .env
+dtctl auth login --context <seu-tenant> --environment "https://<seu-tenant>.apps.dynatrace.com"
 ```
 
-Conteúdo de `.env`:
-```env
-DYNATRACE_ENV_URL=https://seu-tenant.live.dynatrace.com
-DYNATRACE_API_TOKEN=dt0c01...  # Token Classic (opcional, para /api/v2)
-DYNATRACE_PLATFORM_TOKEN=sdt0c60.SV3U5WQXAMPLE...  # Token DQL/Grail (necessário para Davis)
-DYNATRACE_AUTH_MODE=auto
-```
+O comando abrirá uma janela no seu navegador para autenticação SSO. O token OAuth resultante será gerenciado de forma segura pelo `dtctl` no keyring local e renovado automaticamente.
 
-**Opção C: Variável de ambiente permanente**
-
-Adicione ao shell profile (`~/.bashrc`, `~/.zshrc`, etc):
-```bash
-export DYNATRACE_PLATFORM_TOKEN="sdt0c60.SV3U5WQXAMPLE..."
-export DYNATRACE_ENV_URL="https://seu-tenant.live.dynatrace.com"
-```
-
-## Como Usar
-
-### Análise Básica com Davis
+### Passo 3: Valide a Autenticação e Permissões
 
 ```bash
-view_dyna_incidents credit --window=3h --davis
+# Valida conectividade e ambiente
+dtctl doctor
+
+# Confirma o usuário autenticado e contexto
+dtctl auth whoami --plain
 ```
 
-**Output**:
-```
-[1] P-2605153 - Failure rate increase (CLOSED)
-  URL alarme : https://...
-  Origem     : AWS
-  ...
-
-[DAVIS - CAUSATION & CORRELATION]
-============================================================
-
-  [1] Failure rate increase: The error rate increased to 91.43 %.
-       Timestamp: 1778250360000
-       Entidade: credit-caas-contract-manager-service
-       Cadeia de Causacao: cdc-btg -> credit-caas-contract-manager-service -> DynamoDB timeout
-       Eventos Correlacionados: P-2605151 (Lambda error), P-2605160 (SQS throttling)
-
-[DAVIS - ROOT CAUSE ANALYSIS]
-============================================================
-
-  [1] Failure rate increase
-       Tipo de Evento: Failure rate increase
-       Quantidade: 3
-       Latencia P99: 5432ms
-       Taxa de Falha Maxima: 93.81%
-       Entidade Primaria: SERVICE/cdc-btg
-```
-
-### Análise em Período Específico
+### Passo 4: Execute a Análise com Davis
 
 ```bash
-view_dyna_incidents credit \
-  --from "08-05-2026 12h50m" \
-  --to "08-05-2026 15h30m" \
-  --davis
+view_dyna_incidents credit --window=3h
 ```
 
-### Exportar Insights Davis em JSON
+---
 
-```bash
-view_dyna_incidents credit --window=3h --davis --json > incidents_davis.json
-```
+## 🧠 O que é Davis AI?
 
-## Queries DQL Utilizadas
+Davis® é o mecanismo de Inteligência Causal do Dynatrace que correlaciona automaticamente bilhões de dependências em tempo real, fornecendo:
+- **Event Causation**: Cadeia de causa e efeito de eventos correlacionados.
+- **Root Cause Analysis (RCA)**: Identificação automática da entidade primária que causou a degradação ou falha.
+- **Impact Analysis**: Propagação de anomalias em serviços consumidores (callers) e dependências.
+- **Correlation**: Agrupamento automático de alertas e eventos disparados em cascata.
 
-### 1. Fetch Event Causation
+---
 
+## 🛡️ Permissões e Roles Necessárias no Dynatrace (RBAC)
+
+Como a autenticação agora utiliza sua identidade corporativa via SSO, a capacidade do `dtctl` de consultar os dados do Grail e do Davis depende das **roles atribuídas ao seu usuário ou grupo** no Dynatrace Platform:
+
+### Permissões Mínimas Recomendadas
+
+| Permissão | Escopo / Finalidade |
+|---|---|
+| `storage:events:read` | **Obrigatória para Davis**: Permite consultar tabelas `dt.davis.events` e `events`. |
+| `storage:entities:read` | **Obrigatória para Topologia**: Permite consultar `dt.entity.service`, `dt.entity.host`, etc. |
+| `storage:metrics:read` | Permite consultar métricas de infraestrutura e performance via DQL. |
+| `storage:logs:read` | Opcional: Permite consultar logs correlacionados no Grail. |
+
+> [!TIP]
+> Caso receba erro `403 / NOT_AUTHORIZED_FOR_TABLE` ao rodar queries `fetch dt.davis.events`, solicite ao administrador do Dynatrace a atribuição de uma role com permissão `storage:events:read` e `storage:entities:read` ao seu usuário.
+
+---
+
+## 🔍 Exemplos de Consultas DQL Executadas
+
+O `view_dyna_incidents` e o agente Copilot executam automaticamente queries DQL estruturadas via `dtctl`:
+
+### 1. Detalhes do Problema Davis
 ```dql
-fetch events
-| filter timestamp >= 1778244000000 and timestamp <= 1778260000000
-| search "credit"
-| fields timestamp, event.type, event.title, event.status,
-    entity.name, dt.event.causation_chain, dt.event.correlation_events,
-    dt.event.root_cause_entity, dt.event.description
+fetch dt.davis.problems, from:-48h
+| filter event.id == "PROBLEM-ID" or display_id == "P-XXXXXX"
+| limit 1
+```
+
+### 2. Cadeia de Causa-Raiz e Eventos Davis da Entidade
+```dql
+fetch dt.davis.events, from:-48h
+| filter in("SERVICE-XXXXXXXXXXXX", dt.entity.service)
 | sort timestamp desc
 | limit 20
 ```
 
-**O que extrai**:
-- `dt.event.causation_chain`: Ordem de eventos que levaram à falha
-- `dt.event.correlation_events`: Eventos relacionados detectados por Davis
-- `dt.event.root_cause_entity`: Entidade que iniciou a cascata
-
-### 2. Fetch Root Cause Analysis
-
+### 3. Resolução de Callers (Quem chama o serviço afetado?)
 ```dql
-fetch events
-| filter timestamp >= 1778244000000 and timestamp <= 1778260000000
-| search "credit"
-| fields timestamp, event.type, event.title,
-    dt.entity.failure_rate_overall, dt.entity.request_count_total,
-    dt.entity.latency_p99, entity.type, entity.name,
-    dt.event.baseline.error_rate, dt.event.severity
-| stats count() as event_count,
-    avg(dt.entity.latency_p99) as avg_latency,
-    max(dt.entity.failure_rate_overall) as max_failure_rate
-  by event.type, event.title, entity.type, entity.name
+fetch dt.entity.service
+| filter in("SERVICE-XXXXXXXXXXXX", calls)
+| fields entity.name, id
+| limit 10
 ```
 
-**O que extrai**:
-- Taxa de falha vs baseline
-- Latência P99 agregada
-- Contagem e distribuição de eventos por tipo/entidade
+### 4. Resolução de Dependências (O que o serviço afetado consome?)
+```dql
+fetch dt.entity.service
+| filter id == "SERVICE-XXXXXXXXXXXX"
+| fields entity.name, toRelationships.calls
+| limit 1
+```
 
-## Troubleshooting
+---
 
-### Passo 1: Confirmar Token Criado
+## 🛠️ Troubleshooting
 
-No Dynatrace, vá para https://myaccount.dynatrace.com/profile:
-
-1. Na aba **Security** (Segurança)
-2. Procure por **Tokens** ou **API Tokens**
-3. Localize seu token `davis-incidents-analysis` (começa com `sdt0c60` ou similar)
-4. Se não estiver lá, crie um novo seguindo a seção "Como Configurar"
-
-### Passo 2: Validar Token no Ambiente
+### Sessão SSO Expirada (`AUTH_EXPIRED`)
+Os tokens de SSO possuem tempo de expiração padrão. Se o `view_dyna_incidents` ou o MCP alertar que a sessão expirou:
 
 ```bash
-# Verifique se o token está definido
-echo $DYNATRACE_PLATFORM_TOKEN
-
-# Se vazio, configure
-export DYNATRACE_PLATFORM_TOKEN="sdt0c60.SV3U5WQXAMPLE..."
-
-# Ou se estiver no .env
-source .env && echo $DYNATRACE_PLATFORM_TOKEN
+dtctl auth login
 ```
 
-### Erro: "Token DQL/Grail nao configurado"
+### Ambiente Headless / WSL (Sem Keyring)
+Em ambientes como WSL, containers ou servidores sem ambiente gráfico, o keyring do sistema operacional pode não estar disponível. O `view_dyna_incidents` configura isso automaticamente, mas você também pode exportar no shell:
 
 ```bash
-# 1. Confirme que o token foi criado em myaccount.dynatrace.com/profile
-# 2. Copie o token exato (aparece apenas uma vez)
-# 3. Configure em .env ou export
-
-# 4. Teste conectividade
-view_dyna_incidents --diagnose
-
-# Verifique a seção:
-# "dql_execute": { "status": 200, "ok": true, ... }
+export DTCTL_TOKEN_STORAGE=file
 ```
 
-### Erro: "Invalid token" ou "Unauthorized" (401)
-
-- Verifique se o token está ativo e não expirou
-- Confirm scopes: `storage:events:read` e `storage:entities:read`
-- Teste em: https://seu-tenant.apps.dynatrace.com/platform/storage/query/v1/query:execute
-
-### Sem resultados de Davis
-
-- Davis requer **pelo menos 1 incidente aberto** na janela de tempo
-- Eventos devem ter `dt.event.causation_chain` populado (depende de configuração Dynatrace)
-- Se usar modo `--json`, resultados aparecem em estruturas vazias
-
-## Exemplo: Postmortem Completo com Davis
+### Fallback Legado: `DYNATRACE_PLATFORM_TOKEN`
+Caso esteja em um pipeline CI/CD ou ambiente onde a autenticação interativa via SSO (`dtctl auth login`) não possa ser executada, ainda é possível fornecer um token Platform estático:
 
 ```bash
-# 1. Coletar incidentes e análise Davis
-view_dyna_incidents credit --window=4h --davis --json > incident_analysis.json
-
-# 2. Gerar sumário executivo
-view_dyna_incidents credit --window=4h --davis --executive
-
-# 3. Compartilhar em Slack/Teams
-cat incident_analysis.json | jq '.[] | [.alarm, .origin, .workload]' | pbcopy
+export DYNATRACE_PLATFORM_TOKEN="dt0s16.EXAMPLE..."
 ```
 
-## Próximos Passos
+---
 
-- [ ] Configurar DYNATRACE_PLATFORM_TOKEN
-- [ ] Testar `view_dyna_incidents --diagnose` para confirmar Davis
-- [ ] Rodar `--davis` em incidente recente para validar insights
-- [ ] Integrar queries Davis em runbook de SRE
-- [ ] Adicionar alertas que triggerem análise Davis automática
+## 📚 Referências
 
-## Referências
-
-- [Dynatrace DQL Docs](https://docs.dynatrace.com/docs/platform/dynatrace-query-language)
-- [Davis AI Events API](https://docs.dynatrace.com/docs/api-and-integrations/dynatrace-apis/environment-api/events-api)
-- [Root Cause Analysis](https://docs.dynatrace.com/docs/platform/ai-powered-analytics/root-cause-analysis)
+- [Repositório dtctl no GitHub](https://github.com/Dynatrace/dtctl)
+- [Dynatrace DQL - Davis Problems](https://docs.dynatrace.com/docs/platform/dynatrace-query-language)
+- [Davis AI Causation & Root Cause Analysis](https://docs.dynatrace.com/docs/platform/ai-powered-analytics/root-cause-analysis)

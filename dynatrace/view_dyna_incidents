@@ -403,7 +403,7 @@ check_tokens() {
 
   # DYNATRACE_PLATFORM_TOKEN (DQL/Grail — opcional)
   if [[ -z "${DYNATRACE_PLATFORM_TOKEN:-}" ]]; then
-    print_warn "DYNATRACE_PLATFORM_TOKEN não configurado (opcional, para DQL/Grail)"
+    print_ok "dtctl DQL/Grail: autenticação SSO via 'dtctl auth login' (permissões via role, sem necessidade de token)"
   elif [[ "${DYNATRACE_PLATFORM_TOKEN}" != dt0s16.* ]]; then
     print_warn "DYNATRACE_PLATFORM_TOKEN não parece ser um token Platform (esperado dt0s16.*)"
   else
@@ -431,31 +431,19 @@ check_tokens() {
     echo "   • metrics.read     — métricas K8s (CPU, Memory)"
     echo "   • events.read      — detalhes de eventos (opcional)"
     echo ""
-    echo "2. Token Platform/DQL (opcional)"
-    echo "   Crie em: https://myaccount.dynatrace.com → Security → Access Tokens"
+    echo "2. Autenticação Platform / DQL / Davis (via dtctl)"
+    echo "   O dtctl suporta autenticação via SSO (dtctl auth login)."
+    echo "   Não é mais necessário adicionar token; o acesso é garantido pelas roles do usuário no Dynatrace."
+    echo "   Comando: dtctl auth login --context <tenant> --environment \"https://<tenant>.apps.dynatrace.com\""
     echo ""
-    echo "   Scopes:"
-    echo "   • storage:events:read"
-    echo "   • storage:metrics:read"
-    echo "   • storage:entities:read"
-    echo "   • storage:buckets:read"
-    echo "   • storage:bucket-definitions:read"
-    echo "   • environment-api:problems:read"
-    echo "   • app-engine:apps:run"
-    echo "   • app-engine:edge-connects:read"
-    echo "   • app-settings:objects:read"
-    echo "   • settings:objects:write"
-    echo "   • extensions:definitions:read"
-    echo "   • extensions:configurations:read"
-    echo "   • slo:slos:read"
-    echo "   • document:documents:read"
-    echo "   • automation:workflows:read"
+    echo "   (Opcional: DYNATRACE_PLATFORM_TOKEN caso use API REST direta sem dtctl)"
+    echo "   Scopes da role/token: storage:events:read, storage:entities:read, storage:metrics:read"
     echo ""
     echo "3. Adicione ao seu ~/.zshrc (ou ~/.bashrc):"
     echo ""
     echo "   export DYNATRACE_ENV_URL=\"$env_url_display\""
     echo "   export DYNATRACE_API_TOKEN=\"dt0c01.<seu-token>\""
-    echo "   export DYNATRACE_PLATFORM_TOKEN=\"dt0s16.<seu-token>\"  # opcional"
+    echo "   # DYNATRACE_PLATFORM_TOKEN é dispensável se usar dtctl auth login"
     echo "   export DYNATRACE_AUTH_MODE=dql"
     echo ""
     echo "4. Recarregue o shell: source ~/.zshrc"
@@ -945,14 +933,14 @@ setup_dtctl() {
   trap "rm -f '$install_script'" RETURN
 
   if ! curl -fsSL --retry 3 --retry-delay 2 -o "$install_script" \
-       "https://raw.githubusercontent.com/dynatrace-oss/dtctl/main/install.sh" 2>/dev/null; then
+       "https://raw.githubusercontent.com/Dynatrace/dtctl/main/install.sh" 2>/dev/null; then
     print_err "Falha no download do installer."
     echo ""
     echo "  Tente manualmente:"
-    echo "    curl -fsSL https://raw.githubusercontent.com/dynatrace-oss/dtctl/main/install.sh | sh"
+    echo "    curl -fsSL https://raw.githubusercontent.com/Dynatrace/dtctl/main/install.sh | sh"
     echo ""
     echo "  Se o erro persistir (SSL/proxy), baixe direto:"
-    echo "    https://github.com/dynatrace-oss/dtctl/releases/latest"
+    echo "    https://github.com/Dynatrace/dtctl/releases/latest"
     rm -f "$install_script"
     return 1
   fi
@@ -990,99 +978,78 @@ _configure_dtctl_context() {
   # Extrai tenant ID da URL (ex: <tenant-id> de https://<tenant-id>.live.dynatrace.com)
   local tenant_id
   tenant_id="$(echo "$env_url" | sed -E 's|https?://([^.]+)\..*|\1|')"
+  local context_name="$tenant_id"
 
-  # 1. Busca contexto existente cuja environment contenha o mesmo tenant ID
-  local config_file="${HOME}/.config/dtctl/config"
-  if [[ -f "$config_file" ]]; then
-    local existing_ctx=""
-    existing_ctx="$(awk -v tid="$tenant_id" '
-      /- name:/ { ctx=$NF }
-      /environment:/ && $0 ~ tid { print ctx; exit }
-    ' "$config_file")"
-
-    if [[ -n "$existing_ctx" ]]; then
-      local current_ctx
-      current_ctx="$(dtctl config current-context 2>/dev/null || true)"
-      if [[ "$current_ctx" != "$existing_ctx" ]]; then
-        dtctl config use-context "$existing_ctx" 2>/dev/null || true
-        print_ok "dtctl context: '$existing_ctx' (tenant $tenant_id)"
-      fi
-      # Valida com query real (doctor NÃO valida token OAuth expirado)
-      local _dtctl_test
-      _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
-      if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
-        print_ok "dtctl: OK (query validada)"
-        return 0
-      fi
-      # OAuth expirado — tenta reparar com platform token se disponível
-      local token="${DYNATRACE_PLATFORM_TOKEN:-${DYNATRACE_API_TOKEN:-}}"
-      if [[ -n "$token" ]]; then
-        local token_ref
-        token_ref="$(grep -A5 "name: ${existing_ctx}$" "$config_file" 2>/dev/null | grep 'token-ref:' | head -1 | awk '{print $2}' || true)"
-        if [[ -n "$token_ref" ]]; then
-          dtctl config set-credentials "$token_ref" --token "$token" 2>/dev/null || true
-          _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
-          if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
-            print_ok "dtctl: OK (token reparado)"
-            return 0
-          fi
-        fi
-      fi
-      print_warn "dtctl context '$existing_ctx' — token SSO expirado."
-      echo ""
-      echo -e "  \033[1;33mdtctl auth login\033[0m"
-      echo ""
-      if [[ -t 0 ]]; then
-        read -r -p "  Deseja fazer login agora? (s/n): " DTCTL_LOGIN_ANSWER
-        if [[ "$DTCTL_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
-          dtctl auth login
-          _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
-          if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
-            print_ok "dtctl: OK (login realizado)"
-            return 0
-          else
-            print_err "Login dtctl falhou. Tente manualmente: dtctl auth login"
-          fi
-        else
-          print_warn "Continuando sem dtctl autenticado. Análise via DQL pode falhar."
-        fi
-      fi
-      return 0
+  # Para dtctl DQL/Platform, usa a URL apps (.apps. ao invés de .live.)
+  local apps_url="${env_url//.live.dynatrace.com/.apps.dynatrace.com}"
+  if [[ "$apps_url" != *".apps.dynatrace.com"* && "$apps_url" != *".apps."* ]]; then
+    if [[ "$apps_url" == *".dynatrace.com"* ]]; then
+      apps_url="https://${tenant_id}.apps.dynatrace.com"
     fi
   fi
 
-  # 2. Nenhum contexto existente — cria novo baseado no tenant
-  local token="${DYNATRACE_PLATFORM_TOKEN:-${DYNATRACE_API_TOKEN:-}}"
-  if [[ -z "$token" ]]; then
-    print_warn "Nenhum token disponível e nenhum contexto dtctl configurado para $tenant_id"
-    print_warn "Execute: dtctl auth login --context $tenant_id --environment \"${env_url%.live.*}.apps.dynatrace.com\""
+  local config_file="${HOME}/.config/dtctl/config"
+  local target_ctx=""
+
+  # 1. Busca contexto existente cuja environment contenha o mesmo tenant ID
+  if [[ -f "$config_file" ]]; then
+    target_ctx="$(awk -v tid="$tenant_id" '
+      /- name:/ { ctx=$NF }
+      /environment:/ && $0 ~ tid { print ctx; exit }
+    ' "$config_file")"
+  fi
+
+  # 2. Se não existir contexto, cria apontando para o ambiente
+  if [[ -z "$target_ctx" ]]; then
+    target_ctx="$context_name"
+    print_header "Configurando contexto dtctl '$target_ctx'..."
+    dtctl config set-context "$target_ctx" --environment "$apps_url" 2>/dev/null || true
+  fi
+
+  # Garante uso do contexto correto
+  local current_ctx
+  current_ctx="$(dtctl config current-context 2>/dev/null || true)"
+  if [[ "$current_ctx" != "$target_ctx" ]]; then
+    dtctl config use-context "$target_ctx" 2>/dev/null || true
+    print_ok "dtctl context: '$target_ctx' (tenant $tenant_id)"
+  fi
+
+  # 3. Valida autenticação com query real (doctor NÃO valida token OAuth expirado)
+  local _dtctl_test
+  _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+
+  if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+    print_ok "dtctl: OK (autenticado via SSO / role permissions)"
     return 0
   fi
 
-  local context_name="$tenant_id"
-  local token_ref="${context_name}-token"
+  # 4. Sessão não autenticada ou expirada — usa dtctl auth login (dispensa tokens estáticos)
+  print_warn "dtctl context '$target_ctx' não autenticado ou sessão SSO expirada."
+  echo ""
+  echo "  O dtctl suporta autenticação SSO (OAuth2) baseada nas roles e permissões do usuário."
+  echo "  Não é mais necessário adicionar token manual — basta ter as permissões de role no Dynatrace."
+  echo ""
+  echo -e "  \033[1;33mdtctl auth login --context $target_ctx --environment \"$apps_url\"\033[0m"
+  echo ""
 
-  print_header "Configurando dtctl context '$context_name'..."
-
-  # Para dtctl DQL, usa .apps. ao invés de .live.
-  local apps_url="${env_url//.live.dynatrace.com/.apps.dynatrace.com}"
-
-  dtctl config set-context "$context_name" \
-    --environment "$apps_url" \
-    --token-ref "$token_ref" 2>/dev/null || true
-
-  dtctl config set-credentials "$token_ref" \
-    --token "$token" 2>/dev/null || true
-
-  dtctl config use-context "$context_name" 2>/dev/null || true
-
-  # Valida
-  if _run_with_timeout 10 dtctl doctor >/dev/null 2>&1; then
-    print_ok "dtctl doctor: OK"
-  else
-    print_warn "dtctl doctor reportou problemas — recomenda-se:"
-    print_warn "  dtctl auth login --context $context_name --environment \"$apps_url\""
+  if [[ -t 0 ]]; then
+    read -r -p "  Deseja autenticar via dtctl auth login agora? (s/n): " DTCTL_LOGIN_ANSWER
+    if [[ "$DTCTL_LOGIN_ANSWER" =~ ^[sS]$ ]]; then
+      dtctl auth login --context "$target_ctx" --environment "$apps_url"
+      _dtctl_test="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || _dtctl_test=""
+      if [[ -n "$_dtctl_test" ]] && ! echo "$_dtctl_test" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
+        print_ok "dtctl: OK (autenticado com sucesso via SSO)"
+        return 0
+      else
+        print_err "Autenticação dtctl falhou ou permissões de role insuficientes."
+        echo "  Verifique se seu usuário possui roles com acesso ao Grail/DQL no Dynatrace."
+        echo "  Tente manualmente: dtctl auth login --context $target_ctx"
+      fi
+    else
+      print_warn "Continuando sem dtctl autenticado. Análise via DQL pode falhar."
+    fi
   fi
+  return 0
 }
 
 # Persiste variável de ambiente no shell profile do usuário
@@ -1663,32 +1630,33 @@ SETTINGS_EOF
 
     # Revalida dtctl antes de abrir VS Code (query real, não apenas doctor)
     if command -v dtctl >/dev/null 2>&1; then
-      # dtctl doctor verifica config mas NÃO valida se o token OAuth está expirado.
-      # Uma query leve "fetch dt.entity.host | limit 1" é a única forma confiável.
+      # dtctl doctor verifica config mas NÃO valida se a sessão SSO está expirada.
+      # Uma query leve "fetch dt.entity.host | limit 1" é a forma mais confiável.
       dtctl_test_output="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1 | fields entity.name' -o json 2>&1)" || dtctl_test_output=""
       if echo "$dtctl_test_output" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
         echo ""
-        print_warn "Token dtctl SSO expirado."
+        print_warn "Sessão dtctl SSO expirada ou não autenticada."
+        echo "  (dtctl autentica via SSO com permissões por role; nenhum token manual é necessário)"
         echo ""
         echo -e "  \033[1;33mdtctl auth login\033[0m"
         echo ""
         if [[ -t 0 ]]; then
           while true; do
-            read -r -p "  Deseja renovar o login dtctl agora? (s/n): " DTCTL_RELOGIN
+            read -r -p "  Deseja autenticar com dtctl auth login agora? (s/n): " DTCTL_RELOGIN
             case "$(_to_lower "$DTCTL_RELOGIN")" in
               s|sim|y|yes)
                 dtctl auth login
                 # Valida com query real
                 dtctl_retest="$(_run_with_timeout 15 dtctl query 'fetch dt.entity.host | limit 1' -o json 2>&1)" || dtctl_retest=""
                 if echo "$dtctl_retest" | grep -qi "403\|sso\|expired\|unauthorized\|login\|token"; then
-                  print_warn "Login dtctl falhou. Análise DQL pode falhar."
+                  print_warn "Login dtctl falhou ou permissões de role insuficientes. Análise DQL pode falhar."
                 else
-                  print_ok "Token dtctl renovado"
+                  print_ok "Sessão dtctl autenticada com sucesso"
                 fi
                 break
                 ;;
               n|nao|não|no)
-                print_err "Token dtctl expirado. Análise DQL VAI falhar."
+                print_err "Sessão dtctl não autenticada. Análise DQL VAI falhar."
                 echo "  Execute: dtctl auth login"
                 echo ""
                 read -r -p "  Abrir VS Code mesmo assim? (s/n): " OPEN_DTCTL_ANYWAY

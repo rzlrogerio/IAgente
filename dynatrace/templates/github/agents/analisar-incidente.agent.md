@@ -69,14 +69,15 @@ Se qualquer `sre_run_command` retornar **AUTH_EXPIRED**, **PARE IMEDIATAMENTE** 
   > ```
   > Após login, rode `@analisar-incidente` novamente.
 
-- Se `AUTH_EXPIRED: Token Dynatrace SSO expirado`:
-  > ⚠️ **Token Dynatrace SSO expirado.** Execute no terminal:
+- Se `AUTH_EXPIRED: Sessão Dynatrace SSO expirada`:
+  > ⚠️ **Sessão Dynatrace SSO expirada.** Execute no terminal:
   > ```
   > dtctl auth login
   > ```
+  > (O dtctl autentica via SSO com permissões por role — nenhum token manual é necessário)
   > Após login, rode `@analisar-incidente` novamente.
 
-**NÃO continue a análise com tokens expirados.** A análise SEM dados de logs/métricas é INÚTIL e será descartada.
+**NÃO continue a análise com sessões/tokens expirados.** A análise SEM dados de logs/métricas é INÚTIL e será descartada.
 
 **NÃO faça análise parcial.** Sem MCP = sem análise. A análise SEM comandos dtctl/aws/az é INÚTIL e será descartada.
 
@@ -125,13 +126,13 @@ Você pode incluir um resumo de 3-5 linhas máximo no chat, mas os detalhes deve
 ## Tratamento de Erros 403 (DQL)
 
 Se um `dtctl query 'fetch logs ...'` retornar **403 / NOT_AUTHORIZED_FOR_TABLE**:
-- **NÃO tente novamente** com outra sintaxe — o token não tem scope `storage:logs:read`
-- **Registre** na análise: "❌ Logs DQL: token sem scope storage:logs:read (403)"
+- **NÃO tente novamente** com outra sintaxe — a role do usuário não possui permissão `storage:logs:read`
+- **Registre** na análise: "❌ Logs DQL: role sem permissão storage:logs:read (403)"
 - **Alternativa**: Use `aws logs filter-log-events` para buscar logs no CloudWatch
 - **NÃO use kubectl logs** — kubectl é PROIBIDO
 
 Se um `dtctl query 'fetch events ...'` retornar 403:
-- Registre: "❌ Events DQL: token sem permissão (403)"
+- Registre: "❌ Events DQL: role sem permissão para ler eventos (403)"
 - Use a API clássica via dtctl: `dtctl get events --entity-id SERVICE-XXX`
 
 ## Como executar comandos

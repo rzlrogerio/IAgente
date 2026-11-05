@@ -13,10 +13,10 @@ Cada `sre_run_command` aceita APENAS UM comando simples. Sem pipes, sem `&&`, se
 
 Se qualquer comando retornar `AUTH_EXPIRED`, **PARE** e informe ao usuário:
 - Azure: "Execute `az login` no terminal e tente novamente"
-- Dynatrace: "Execute `dtctl auth login` no terminal e tente novamente"
+- Dynatrace: "Execute `dtctl auth login` no terminal e tente novamente (autenticação SSO via roles, sem necessidade de token)"
 - AWS: "Execute `aws sso login --profile PROFILE` no terminal e tente novamente"
 
-**NÃO continue análise com tokens expirados — os dados serão incompletos.**
+**NÃO continue análise com sessões/tokens expirados — os dados serão incompletos.**
 
 ## Estrutura
 
